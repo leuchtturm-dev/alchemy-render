@@ -1,0 +1,118 @@
+{
+  "name": "alchemy-render",
+  "version": "0.1.0",
+  "description": "Alchemy v2 provider for Render.com",
+  "type": "module",
+  "sideEffects": false,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leuchtturm-dev/alchemy-render.git"
+  },
+  "homepage": "https://github.com/leuchtturm-dev/alchemy-render#readme",
+  "bugs": {
+    "url": "https://github.com/leuchtturm-dev/alchemy-render/issues"
+  },
+  "keywords": ["alchemy", "render", "infrastructure-as-code", "iac", "provider"],
+  "files": [
+    "dist",
+    "src",
+    "examples",
+    "scripts",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "bun": "./src/index.ts",
+      "worker": "./src/index.ts",
+      "import": "./dist/index.js"
+    },
+    "./Api": {
+      "types": "./dist/Api/index.d.ts",
+      "bun": "./src/Api/index.ts",
+      "worker": "./src/Api/index.ts",
+      "import": "./dist/Api/index.js"
+    },
+    "./Actions": {
+      "types": "./dist/Actions.d.ts",
+      "bun": "./src/Actions.ts",
+      "worker": "./src/Actions.ts",
+      "import": "./dist/Actions.js"
+    },
+    "./Account": {
+      "types": "./dist/AccountResources.d.ts",
+      "bun": "./src/AccountResources.ts",
+      "worker": "./src/AccountResources.ts",
+      "import": "./dist/AccountResources.js"
+    },
+    "./Datastores": {
+      "types": "./dist/Datastores.d.ts",
+      "bun": "./src/Datastores.ts",
+      "worker": "./src/Datastores.ts",
+      "import": "./dist/Datastores.js"
+    },
+    "./EnvironmentGroups": {
+      "types": "./dist/EnvironmentGroups.d.ts",
+      "bun": "./src/EnvironmentGroups.ts",
+      "worker": "./src/EnvironmentGroups.ts",
+      "import": "./dist/EnvironmentGroups.js"
+    },
+    "./Projects": {
+      "types": "./dist/Projects.d.ts",
+      "bun": "./src/Projects.ts",
+      "worker": "./src/Projects.ts",
+      "import": "./dist/Projects.js"
+    },
+    "./Services": {
+      "types": "./dist/Services.d.ts",
+      "bun": "./src/Services.ts",
+      "worker": "./src/Services.ts",
+      "import": "./dist/Services.js"
+    },
+    "./ServiceConfiguration": {
+      "types": "./dist/ServiceConfiguration.d.ts",
+      "bun": "./src/ServiceConfiguration.ts",
+      "worker": "./src/ServiceConfiguration.ts",
+      "import": "./dist/ServiceConfiguration.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
+    "check": "tsc --noEmit && vitest run",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "generate:api": "node scripts/generate-api.mjs",
+    "check:api": "node scripts/check-generated-api.mjs",
+    "check:exports": "node scripts/check-package-exports.mjs",
+    "prepack": "npm run check && npm run check:api && npm run build && npm run check:exports"
+  },
+  "peerDependencies": {
+    "alchemy": ">=2.0.0-beta.62 <2.1",
+    "effect": ">=4.0.0-beta.97 <4.1"
+  },
+  "devDependencies": {
+    "@effect/vitest": "^4.0.0-beta.97",
+    "@types/node": "^24.0.0",
+    "alchemy": "2.0.0-beta.62",
+    "effect": "4.0.0-beta.97",
+    "openapi-typescript": "7.13.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.1.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "bun@1.3.13",
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "openapi-fetch": "^0.15.0"
+  }
+}
