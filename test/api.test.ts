@@ -113,6 +113,39 @@ describe("Render API transport", () => {
     expect(sleeps).toEqual([2000]);
   });
 
+  it("retries a rate-limited POST because Render rejected the request", async () => {
+    const sleeps: number[] = [];
+    const bodies: string[] = [];
+    let calls = 0;
+    const fetch = createRenderFetch({
+      disableRateLimit: true,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+      fetch: (async (input: RequestInfo | URL, init?: RequestInit) => {
+        calls++;
+        bodies.push(await new Request(input, init).text());
+        return calls === 1
+          ? new Response(null, {
+              status: 429,
+              headers: { "ratelimit-reset": "2" },
+            })
+          : new Response("ok");
+      }) as typeof globalThis.fetch,
+    });
+    const response = await fetch("https://render.invalid/services", {
+      method: "POST",
+      body: JSON.stringify({ name: "api" }),
+    });
+    expect(response.status).toBe(200);
+    expect(calls).toBe(2);
+    expect(sleeps).toEqual([2000]);
+    expect(bodies).toEqual([
+      JSON.stringify({ name: "api" }),
+      JSON.stringify({ name: "api" }),
+    ]);
+  });
+
   it("never retries unsafe POST on network or 5xx failures", async () => {
     let networkCalls = 0;
     const network = createRenderFetch({

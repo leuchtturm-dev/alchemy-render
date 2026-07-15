@@ -5,6 +5,7 @@ import { poll, RenderApiError, type RenderApiClient } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
   digest,
+  moveEnvironmentResource,
   restProvider,
   unwrapEntity,
   type CommonAttributes,
@@ -13,7 +14,7 @@ import type { Region } from "./Services.js";
 
 export interface DatastoreIpRule {
   readonly cidrBlock: string;
-  readonly description?: string;
+  readonly description: string;
 }
 
 export type PostgresPlan =
@@ -111,6 +112,7 @@ export interface DatastoreAttributes extends CommonAttributes {
   readonly region?: Region;
   readonly dashboardUrl?: string;
   readonly version?: string;
+  readonly diskSizeGB?: number;
   readonly databaseName?: string;
   readonly databaseUser?: string;
   readonly environmentId?: string;
@@ -162,6 +164,9 @@ const attrs = (
       ? { dashboardUrl: string(entity.dashboardUrl)! }
       : {}),
     ...(string(entity.version) ? { version: string(entity.version)! } : {}),
+    ...(typeof entity.diskSizeGB === "number"
+      ? { diskSizeGB: entity.diskSizeGB }
+      : {}),
     ...(string(entity.databaseName)
       ? { databaseName: string(entity.databaseName)! }
       : {}),
@@ -261,11 +266,52 @@ const hydrateConnection = (
         ),
       );
     }
+    if (
+      current.status === "suspended" ||
+      current.status === "maintenance_scheduled" ||
+      current.status === "maintenance_in_progress" ||
+      current.status === "unknown"
+    ) {
+      return current;
+    }
     const info = yield* api.request({
       method: "GET",
       path: `/${kind}/${encodeURIComponent(current.datastoreId)}/connection-info`,
     });
     return { ...current, connectionInfo: redactConnectionInfo(info) };
+  });
+
+const finalizeDatastore = (
+  kind: "postgres" | "key-value" | "redis",
+  attributes: DatastoreAttributes,
+  props: PostgresProps | KeyValueProps,
+  api: RenderApiClient,
+  phase: "read" | "create" | "update" | "reconcile",
+) =>
+  Effect.gen(function* () {
+    let current = attributes;
+    if (phase === "create") {
+      if (props.environmentId !== undefined) {
+        current = { ...current, environmentId: props.environmentId };
+      }
+    } else if (
+      phase !== "read" &&
+      current.environmentId !== props.environmentId
+    ) {
+      yield* moveEnvironmentResource(
+        api,
+        current.datastoreId,
+        current.environmentId,
+        props.environmentId,
+      );
+      const { environmentId: _previousEnvironment, ...withoutEnvironment } =
+        current;
+      current =
+        props.environmentId === undefined
+          ? withoutEnvironment
+          : { ...withoutEnvironment, environmentId: props.environmentId };
+    }
+    return yield* hydrateConnection(kind, current, api);
   });
 
 const keyValueBody = (
@@ -304,13 +350,34 @@ export const PostgresProvider = () =>
     item: (id) => `/postgres/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["datastoreId"],
-    immutable: [
-      "region",
-      "version",
-      "databaseName",
-      "databaseUser",
-      "environmentId",
-    ],
+    immutable: ["region", "version", "databaseName", "databaseUser"],
+    validate: (props, observed, previousProps) => {
+      if (
+        props.diskSizeGB !== undefined &&
+        (!Number.isInteger(props.diskSizeGB) || props.diskSizeGB < 1)
+      ) {
+        return Effect.fail(
+          new RenderApiError(
+            "Render Postgres diskSizeGB must be a positive integer",
+          ),
+        );
+      }
+      if (
+        props.diskSizeGB !== undefined &&
+        observed?.diskSizeGB !== undefined &&
+        props.diskSizeGB < observed.diskSizeGB &&
+        (props.enableDiskAutoscaling !== true ||
+          (previousProps?.diskSizeGB !== undefined &&
+            props.diskSizeGB < previousProps.diskSizeGB))
+      ) {
+        return Effect.fail(
+          new RenderApiError(
+            `Render Postgres storage can only grow (current ${observed.diskSizeGB} GB, requested ${props.diskSizeGB} GB)`,
+          ),
+        );
+      }
+      return Effect.void;
+    },
     attributes: attrs,
     observe: (entity) => ({
       name: entity.name,
@@ -345,10 +412,15 @@ export const PostgresProvider = () =>
           : Redacted.value(props.datadogApiKey),
       datadogSite: props.datadogSite,
     }),
-    updateBody: (props, name) => ({
+    updateBody: (props, name, _ownerId, previous) => ({
       name,
       plan: props.plan,
-      diskSizeGB: props.diskSizeGB,
+      diskSizeGB:
+        props.diskSizeGB !== undefined &&
+        previous?.diskSizeGB !== undefined &&
+        props.diskSizeGB <= previous.diskSizeGB
+          ? undefined
+          : props.diskSizeGB,
       enableHighAvailability: props.enableHighAvailability ?? false,
       enableDiskAutoscaling: props.enableDiskAutoscaling ?? false,
       connectionPool: props.connectionPool ?? "none",
@@ -357,14 +429,25 @@ export const PostgresProvider = () =>
       readReplicas: props.readReplicas ?? [],
       datadogAPIKey:
         props.datadogApiKey === undefined
-          ? ""
+          ? previous?.datadogApiKeyDigest === undefined
+            ? undefined
+            : ""
           : Redacted.value(props.datadogApiKey),
-      datadogSite: props.datadogSite ?? "",
+      datadogSite:
+        props.datadogSite === undefined && previous?.datadogSite !== undefined
+          ? ""
+          : props.datadogSite,
     }),
-    compareBody: (props, name) => ({
+    compareBody: (props, name, _ownerId, previous) => ({
       name,
       plan: props.plan,
-      diskSizeGB: props.diskSizeGB,
+      diskSizeGB:
+        props.enableDiskAutoscaling === true &&
+        props.diskSizeGB !== undefined &&
+        previous?.diskSizeGB !== undefined &&
+        props.diskSizeGB <= previous.diskSizeGB
+          ? undefined
+          : props.diskSizeGB,
       enableHighAvailability: props.enableHighAvailability ?? false,
       enableDiskAutoscaling: props.enableDiskAutoscaling ?? false,
       connectionPool: props.connectionPool ?? "none",
@@ -373,6 +456,7 @@ export const PostgresProvider = () =>
       readReplicas: props.readReplicas ?? [],
     }),
     sensitiveChanged: (_olds, props, output) =>
+      output.environmentId !== props.environmentId ||
       output.datadogApiKeyDigest !==
         (props.datadogApiKey ? digest(props.datadogApiKey) : undefined) ||
       output.datadogSite !== props.datadogSite,
@@ -390,8 +474,8 @@ export const PostgresProvider = () =>
         ...(props.datadogSite ? { datadogSite: props.datadogSite } : {}),
       };
     },
-    finalize: (attributes, _props, api) =>
-      hydrateConnection("postgres", attributes, api),
+    finalize: (attributes, props, api, phase) =>
+      finalizeDatastore("postgres", attributes, props, api, phase),
   });
 
 export const KeyValueProvider = () =>
@@ -400,14 +484,16 @@ export const KeyValueProvider = () =>
     item: (id) => `/key-value/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["datastoreId"],
-    immutable: ["region", "environmentId"],
+    immutable: ["region"],
     attributes: attrs,
     observe: keyValueObserve,
     body: (props, name, ownerId) => keyValueBody(props, name, ownerId, true),
     updateBody: (props, name, ownerId) =>
       keyValueBody(props, name, ownerId, false),
-    finalize: (attributes, _props, api) =>
-      hydrateConnection("key-value", attributes, api),
+    sensitiveChanged: (_olds, props, output) =>
+      output.environmentId !== props.environmentId,
+    finalize: (attributes, props, api, phase) =>
+      finalizeDatastore("key-value", attributes, props, api, phase),
   });
 
 export const RedisProvider = () =>
@@ -416,12 +502,14 @@ export const RedisProvider = () =>
     item: (id) => `/redis/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["datastoreId"],
-    immutable: ["region", "environmentId"],
+    immutable: ["region"],
     attributes: attrs,
     observe: keyValueObserve,
     body: (props, name, ownerId) => keyValueBody(props, name, ownerId, true),
     updateBody: (props, name, ownerId) =>
       keyValueBody(props, name, ownerId, false),
-    finalize: (attributes, _props, api) =>
-      hydrateConnection("redis", attributes, api),
+    sensitiveChanged: (_olds, props, output) =>
+      output.environmentId !== props.environmentId,
+    finalize: (attributes, props, api, phase) =>
+      finalizeDatastore("redis", attributes, props, api, phase),
   });

@@ -5,7 +5,9 @@ import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { paginate, poll, RenderApi, RenderApiError } from "./Api/Api.js";
+import type { components } from "./Api/schema.js";
 import type { Providers } from "./Providers.js";
+import type { Region } from "./Services.js";
 import {
   resourceClass,
   digest,
@@ -19,13 +21,13 @@ import {
 export interface DedicatedIpProps {
   readonly name?: string;
   readonly description?: string;
-  readonly region: string;
+  readonly region: Region;
   readonly environmentIds?: readonly string[];
 }
 export interface DedicatedIpAttributes extends CommonAttributes {
   readonly dedicatedIpId: string;
   readonly description?: string;
-  readonly region?: string;
+  readonly region?: Region;
   readonly environmentIds: readonly string[];
   readonly ips: readonly string[];
 }
@@ -46,11 +48,15 @@ export interface RegistryCredentialAttributes extends CommonAttributes {
   readonly username?: string;
   readonly authTokenDigest?: string;
 }
+export type WebhookEvent =
+  components["schemas"]["webhookEventWithCursor"]["webhookEvent"]["eventType"];
+
 export interface WebhookProps {
   readonly name?: string;
   readonly url: string;
   readonly enabled?: boolean;
-  readonly eventFilter?: readonly string[];
+  /** An empty list subscribes the webhook to every event type. */
+  readonly eventFilter?: readonly WebhookEvent[];
 }
 export interface WebhookAttributes extends CommonAttributes {
   readonly webhookId: string;
@@ -234,7 +240,7 @@ const dedicatedAttrs = (
     ...(string(e, "description")
       ? { description: string(e, "description")! }
       : {}),
-    ...(region ? { region } : {}),
+    ...(region ? { region: region as Region } : {}),
     ...(string(e, "status") ? { status: string(e, "status")! } : {}),
   };
 };
@@ -785,7 +791,7 @@ export const ServiceNotificationOverrideProvider = () =>
                   method: "GET",
                   path: "/notification-settings/overrides",
                   query: {
-                    ownerId: api.ownerId,
+                    ownerId: [api.ownerId],
                     limit: 100,
                     ...(cursor === undefined ? {} : { cursor }),
                   },

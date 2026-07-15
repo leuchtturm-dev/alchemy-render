@@ -9,6 +9,7 @@ import type { Providers } from "./Providers.js";
 import {
   resourceClass,
   digest,
+  moveEnvironmentResource,
   restProvider,
   reveal,
   unwrapEntity,
@@ -94,7 +95,6 @@ export const EnvironmentGroupProvider = () =>
     item: (id) => `/env-groups/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["environmentGroupId"],
-    immutable: ["environmentId"],
     body: (p, name, ownerId) => ({
       name,
       ownerId,
@@ -102,6 +102,8 @@ export const EnvironmentGroupProvider = () =>
       envVars: [],
     }),
     updateBody: (_p, name) => ({ name }),
+    sensitiveChanged: (_olds, props, output) =>
+      output.environmentId !== props.environmentId,
     attributes: (e, f) => {
       const id = typeof e.id === "string" ? e.id : f.id;
       return {
@@ -114,6 +116,27 @@ export const EnvironmentGroupProvider = () =>
           : {}),
       };
     },
+    finalize: (attributes, props, api, phase) =>
+      Effect.gen(function* () {
+        if (phase === "read") return attributes;
+        if (phase === "create") {
+          return props.environmentId === undefined
+            ? attributes
+            : { ...attributes, environmentId: props.environmentId };
+        }
+        if (attributes.environmentId === props.environmentId) return attributes;
+        yield* moveEnvironmentResource(
+          api,
+          attributes.environmentGroupId,
+          attributes.environmentId,
+          props.environmentId,
+        );
+        const { environmentId: _previousEnvironment, ...withoutEnvironment } =
+          attributes;
+        return props.environmentId === undefined
+          ? withoutEnvironment
+          : { ...withoutEnvironment, environmentId: props.environmentId };
+      }),
   });
 
 export const EnvironmentGroupLinkProvider = () =>

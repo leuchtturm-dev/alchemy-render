@@ -9,6 +9,7 @@ import {
 } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
+  moveEnvironmentResource,
   restProvider,
   unwrapEntity,
   unwrapRows,
@@ -58,7 +59,7 @@ export interface BuildFilter {
 
 export interface ServiceIpRule {
   readonly cidrBlock: string;
-  readonly description?: string;
+  readonly description: string;
 }
 
 const ALLOW_ALL_IPS = [
@@ -72,6 +73,10 @@ export interface NativeSource {
   readonly buildCommand: string;
   readonly startCommand: string;
   readonly image?: never;
+  readonly dockerCommand?: never;
+  readonly dockerContext?: never;
+  readonly dockerfilePath?: never;
+  readonly registryCredentialId?: never;
 }
 
 export interface DockerSource {
@@ -83,6 +88,8 @@ export interface DockerSource {
   readonly dockerfilePath?: string;
   readonly registryCredentialId?: string;
   readonly image?: never;
+  readonly buildCommand?: never;
+  readonly startCommand?: never;
 }
 
 export interface ImageSource {
@@ -93,29 +100,34 @@ export interface ImageSource {
   };
   readonly repo?: never;
   readonly branch?: never;
+  readonly buildCommand?: never;
+  readonly startCommand?: never;
+  readonly dockerCommand?: never;
+  readonly dockerContext?: never;
+  readonly dockerfilePath?: never;
+  readonly registryCredentialId?: never;
 }
 
-export interface ServiceSourceProps {
-  readonly runtime: ServiceRuntime;
-  readonly repo?: string;
-  readonly branch?: string;
-  readonly image?: {
-    readonly imagePath: string;
-    readonly registryCredentialId?: string;
-  };
-  readonly buildCommand?: string;
-  readonly startCommand?: string;
-  readonly dockerCommand?: string;
-  readonly dockerContext?: string;
-  readonly dockerfilePath?: string;
-  readonly registryCredentialId?: string;
-}
+/** Source configuration shared by repository- and image-backed services. */
+export type ServiceSourceProps = NativeSource | DockerSource | ImageSource;
 
 export type ServiceEnvironment = Readonly<
   Record<string, Redacted.Redacted<string>>
 >;
 
-export interface ServiceCoreProps {
+export interface ServiceDeploymentProps {
+  /**
+   * Complete environment owned by this service. Omit to leave environment
+   * variables unmanaged; use an empty object to remove all managed variables.
+   */
+  readonly env?: ServiceEnvironment;
+  /** Wait for the deployment created by reconciliation to reach `live`. */
+  readonly waitForDeploy?: boolean;
+  /** @default 10800000 (3 hours) */
+  readonly deployTimeoutMs?: number;
+}
+
+export interface ServiceCoreProps extends ServiceDeploymentProps {
   /** Physical name. Alchemy generates one when omitted. */
   readonly name?: string;
   readonly autoDeploy?: AutoDeploy;
@@ -125,20 +137,11 @@ export interface ServiceCoreProps {
   readonly preDeployCommand?: string;
   readonly previews?: { readonly generation?: "off" | "manual" | "automatic" };
   readonly maxShutdownDelaySeconds?: number;
-  /**
-   * Complete environment owned by this service. Omit to leave environment
-   * variables unmanaged; use an empty object to remove all managed variables.
-   */
-  readonly env?: ServiceEnvironment;
   /** Fixed/manual instance count. Do not combine with Autoscaling. */
   readonly numInstances?: number;
-  /** Wait for the deployment created by reconciliation to reach `live`. */
-  readonly waitForDeploy?: boolean;
-  /** @default 10800000 (3 hours) */
-  readonly deployTimeoutMs?: number;
 }
 
-export interface WebServiceProps extends ServiceCoreProps, ServiceSourceProps {
+interface WebServiceConfiguration extends ServiceCoreProps {
   readonly plan?: ServicePlan;
   readonly region?: Region;
   readonly healthCheckPath?: string;
@@ -155,45 +158,48 @@ export interface WebServiceProps extends ServiceCoreProps, ServiceSourceProps {
       | "origin-controlled-all";
   };
 }
-export interface PrivateServiceProps
-  extends ServiceCoreProps,
-    ServiceSourceProps {
+export type WebServiceProps = WebServiceConfiguration & ServiceSourceProps;
+
+interface PrivateServiceConfiguration extends ServiceCoreProps {
   readonly plan?: PaidServicePlan;
   readonly region?: Region;
 }
-export interface BackgroundWorkerProps
-  extends ServiceCoreProps,
-    ServiceSourceProps {
+export type PrivateServiceProps =
+  PrivateServiceConfiguration & ServiceSourceProps;
+
+interface BackgroundWorkerConfiguration extends ServiceCoreProps {
   readonly plan?: PaidServicePlan;
   readonly region?: Region;
 }
-export interface CronJobProps extends ServiceSourceProps {
+export type BackgroundWorkerProps =
+  BackgroundWorkerConfiguration & ServiceSourceProps;
+
+interface CronJobConfiguration extends ServiceDeploymentProps {
   readonly name?: string;
   readonly autoDeploy?: AutoDeploy;
   readonly rootDir?: string;
   readonly environmentId?: string;
   readonly buildFilter?: BuildFilter;
-  readonly waitForDeploy?: boolean;
-  readonly deployTimeoutMs?: number;
   readonly plan?: PaidServicePlan;
   readonly region?: Region;
   readonly schedule: string;
 }
-export interface StaticSiteProps {
+export type CronJobProps = CronJobConfiguration & ServiceSourceProps;
+
+export interface StaticSiteProps extends ServiceDeploymentProps {
   readonly name?: string;
   readonly repo: string;
-  readonly branch: string;
+  /** Omit to use the repository's default branch. */
+  readonly branch?: string;
   readonly autoDeploy?: AutoDeploy;
   readonly rootDir?: string;
   readonly environmentId?: string;
   readonly buildFilter?: BuildFilter;
-  readonly buildCommand: string;
+  readonly buildCommand?: string;
   readonly publishPath?: string;
   readonly previews?: { readonly generation?: "off" | "manual" | "automatic" };
   readonly renderSubdomainPolicy?: "enabled" | "disabled";
   readonly ipAllowList?: readonly ServiceIpRule[];
-  readonly waitForDeploy?: boolean;
-  readonly deployTimeoutMs?: number;
 }
 
 export interface ServiceAttributes extends CommonAttributes {
@@ -332,8 +338,11 @@ const scalable = new Set<ServiceAttributes["type"]>([
 ]);
 
 const validateNumInstances = (value: number | undefined) => {
-  if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
-    throw new Error("Render numInstances must be a positive integer");
+  if (
+    value !== undefined &&
+    (!Number.isInteger(value) || value < 1 || value > 100)
+  ) {
+    throw new Error("Render numInstances must be an integer from 1 to 100");
   }
 };
 
@@ -512,8 +521,8 @@ const createBody = (
   autoDeploy: props.autoDeploy,
   rootDir: props.rootDir,
   buildFilter: props.buildFilter,
-  ...(scalable.has(kind) && (props as ServiceCoreProps).env !== undefined
-    ? { envVars: environmentBody((props as ServiceCoreProps).env!) }
+  ...((props as ServiceDeploymentProps).env !== undefined
+    ? { envVars: environmentBody((props as ServiceDeploymentProps).env!) }
     : {}),
   ...(kind === "static_site"
     ? { repo: props.repo, branch: props.branch }
@@ -544,7 +553,12 @@ const coreDigest = (
   ownerId: string,
 ) =>
   createHash("sha256")
-    .update(JSON.stringify(updateBody(kind, props, name, ownerId)))
+    .update(
+      JSON.stringify({
+        ...updateBody(kind, props, name, ownerId),
+        environmentId: props.environmentId,
+      }),
+    )
     .digest("hex");
 
 const record = (value: unknown): Record<string, unknown> =>
@@ -737,10 +751,10 @@ const provider = <R extends ManagedService>(
     ownerScoped: true,
     stables: ["serviceId"] as Extract<keyof R["Attributes"], string>[],
     filter: (entity: Record<string, unknown>) => entity.type === kind,
-    lookupQuery: () => ({ type: kind }),
-    immutable: (kind === "static_site"
-      ? ["environmentId"]
-      : ["environmentId", "region"]) as (keyof R["Props"])[],
+    lookupQuery: () => ({ type: [kind] }),
+    immutable: (kind === "static_site" ? [] : ["region"]) as (
+      keyof R["Props"]
+    )[],
     body: (props, name, ownerId) => createBody(kind, props, name, ownerId),
     updateBody: (props, name, ownerId) =>
       updateBody(kind, props, name, ownerId),
@@ -760,19 +774,21 @@ const provider = <R extends ManagedService>(
       ) {
         return true;
       }
-      if (!scalable.has(kind)) return false;
-      const desired = news as ServiceCoreProps;
+      const desired = news as ServiceDeploymentProps & {
+        readonly numInstances?: number;
+      };
       const desiredEnvDigest =
         desired.env === undefined ? undefined : environmentDigest(desired.env);
       return (
+        news.environmentId !== output.environmentId ||
         desiredEnvDigest !== output.envDigest ||
-        (desired.numInstances !== undefined &&
+        (scalable.has(kind) &&
+          desired.numInstances !== undefined &&
           desired.numInstances !== output.numInstances)
       );
     },
     remoteSensitiveChanged: (news, output, api) => {
-      if (!scalable.has(kind)) return Effect.succeed(false);
-      const desired = news as ServiceCoreProps;
+      const desired = news as ServiceDeploymentProps;
       if (desired.env === undefined) return Effect.succeed(false);
       const digest = environmentDigest(desired.env);
       if (digest !== output.envDigest) return Effect.succeed(true);
@@ -789,15 +805,52 @@ const provider = <R extends ManagedService>(
           props.name ?? current.name ?? current.serviceId,
           current.ownerId ?? api.ownerId,
         );
+        const hasManagedWebCache =
+          kind === "web_service" &&
+          (props as WebServiceProps).cache !== undefined;
+        const hasUnknownCacheTransition =
+          phase === "reconcile" &&
+          hasManagedWebCache &&
+          current.coreDigest === undefined;
         let needsDeployment =
           phase === "update" ||
+          hasUnknownCacheTransition ||
           (phase === "reconcile" &&
             current.coreDigest !== undefined &&
             current.coreDigest !== desiredCoreDigest);
         let deploymentToWaitFor =
           phase === "create" ? current.deployId : undefined;
-        if (phase === "create" || current.coreDigest === undefined) {
+        if (
+          phase === "create" ||
+          (current.coreDigest === undefined &&
+            !(phase === "read" && hasManagedWebCache))
+        ) {
           current = { ...current, coreDigest: desiredCoreDigest };
+        }
+
+        if (phase === "create") {
+          if (props.environmentId !== undefined) {
+            current = { ...current, environmentId: props.environmentId };
+          }
+        } else if (
+          phase !== "read" &&
+          current.environmentId !== props.environmentId
+        ) {
+          yield* moveEnvironmentResource(
+            api,
+            current.serviceId,
+            current.environmentId,
+            props.environmentId,
+          );
+          const { environmentId: _previousEnvironment, ...withoutEnvironment } =
+            current;
+          current = (props.environmentId === undefined
+            ? withoutEnvironment
+            : {
+                ...withoutEnvironment,
+                environmentId: props.environmentId,
+              }) as R["Attributes"];
+          needsDeployment = true;
         }
 
         if (
@@ -823,46 +876,47 @@ const provider = <R extends ManagedService>(
           needsDeployment = true;
         }
 
+        const deployment = props as ServiceDeploymentProps;
+        if (deployment.env !== undefined) {
+          const desiredDigest = environmentDigest(deployment.env);
+          if (phase === "create") {
+            current = { ...current, envDigest: desiredDigest };
+          } else if (phase === "read") {
+            if (current.envDigest === undefined) {
+              current = {
+                ...current,
+                envDigest: yield* readEnvironmentDigest(
+                  api,
+                  current.serviceId,
+                ),
+              };
+            }
+          } else {
+            const observedDigest = yield* readEnvironmentDigest(
+              api,
+              current.serviceId,
+            );
+            const transitionWasUnpersisted =
+              current.envDigest !== desiredDigest;
+            if (observedDigest !== desiredDigest) {
+              yield* api.request({
+                method: "PUT",
+                path: `/services/${encodeURIComponent(current.serviceId)}/env-vars`,
+                body: environmentBody(deployment.env),
+              });
+              needsDeployment = true;
+            }
+            if (transitionWasUnpersisted) needsDeployment = true;
+            current = { ...current, envDigest: desiredDigest };
+          }
+        } else if (phase !== "read" && current.envDigest !== undefined) {
+          const { envDigest: _released, ...released } = current;
+          current = released as R["Attributes"];
+        }
+
         if (scalable.has(kind)) {
           const desired = props as ServiceCoreProps;
           validateNumInstances(desired.numInstances);
-          if (desired.env !== undefined) {
-            const desiredDigest = environmentDigest(desired.env);
-            if (phase === "create") {
-              current = { ...current, envDigest: desiredDigest };
-            } else if (phase === "read") {
-              if (current.envDigest === undefined) {
-                current = {
-                  ...current,
-                  envDigest: yield* readEnvironmentDigest(
-                    api,
-                    current.serviceId,
-                  ),
-                };
-              }
-            } else {
-              const observedDigest = yield* readEnvironmentDigest(
-                api,
-                current.serviceId,
-              );
-              const transitionWasUnpersisted =
-                current.envDigest !== desiredDigest;
-              if (observedDigest !== desiredDigest) {
-                yield* api.request({
-                  method: "PUT",
-                  path: `/services/${encodeURIComponent(current.serviceId)}/env-vars`,
-                  body: environmentBody(desired.env),
-                });
-                needsDeployment = true;
-              }
-              if (transitionWasUnpersisted) needsDeployment = true;
-              current = { ...current, envDigest: desiredDigest };
-            }
-          } else if (phase !== "read" && current.envDigest !== undefined) {
-            const { envDigest: _released, ...released } = current;
-            current = released as R["Attributes"];
-          }
-
           if (
             phase !== "create" &&
             phase !== "read" &&

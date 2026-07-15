@@ -20,7 +20,7 @@ import {
 
 export interface EnvironmentIpRule {
   readonly cidrBlock: string;
-  readonly description?: string;
+  readonly description: string;
 }
 
 export interface ProjectProps {
@@ -145,7 +145,7 @@ const listEnvironments = (api: RenderApiClient) =>
             method: "GET",
             path: "/projects",
             query: {
-              ownerId: api.ownerId,
+              ownerId: [api.ownerId],
               limit: 100,
               ...(cursor === undefined ? {} : { cursor }),
             },
@@ -166,7 +166,7 @@ const listEnvironments = (api: RenderApiClient) =>
                 method: "GET",
                 path: "/environments",
                 query: {
-                  projectId,
+                  projectId: [projectId],
                   limit: 100,
                   ...(cursor === undefined ? {} : { cursor }),
                 },
@@ -196,7 +196,7 @@ export const EnvironmentProvider = () =>
     item: (id) => `/environments/${encodeURIComponent(id)}`,
     ownerScoped: false,
     stables: ["environmentId", "projectId"],
-    lookupQuery: (props) => ({ projectId: props.projectId }),
+    lookupQuery: (props) => ({ projectId: [props.projectId] }),
     list: listEnvironments,
     immutable: ["projectId"],
     body: (props, name) => ({

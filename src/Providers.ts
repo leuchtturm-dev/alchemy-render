@@ -1,7 +1,6 @@
 import { CredentialsStoreLive } from "alchemy/Auth/Credentials";
 import { ProfileLive } from "alchemy/Auth/Profile";
 import * as Provider from "alchemy/Provider";
-import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Api from "./Api/Api.js";
 import {
@@ -84,16 +83,6 @@ export class Providers extends Provider.ProviderCollection<Providers>()(
   "Render",
 ) {}
 
-interface RenderProviderCollection extends Provider.ProviderCollectionService {
-  readonly renderApi: Effect.Effect<Api.RenderApiClient, Api.RenderApiError>;
-}
-
-/** Internal bridge that lets Actions use the same stack-level provider Layer. */
-export const apiFromProviders = Effect.gen(function* () {
-  const collection = yield* Providers;
-  return (collection as RenderProviderCollection).renderApi;
-});
-
 export type ProviderRequirements = Layer.Services<ReturnType<typeof providers>>;
 
 const resources = [
@@ -130,14 +119,7 @@ const resources = [
 ];
 
 export const providers = (options: Api.RenderApiLayerOptions = {}) =>
-  Layer.effect(
-    Providers,
-    Effect.gen(function* () {
-      const collection = yield* Provider.collection(resources);
-      const renderApi = yield* Api.RenderApi;
-      return { ...collection, renderApi } satisfies RenderProviderCollection;
-    }),
-  ).pipe(
+  Layer.effect(Providers, Provider.collection(resources)).pipe(
     Layer.provide(
       Layer.mergeAll(
         WebServiceProvider(),

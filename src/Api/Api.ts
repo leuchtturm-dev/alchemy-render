@@ -43,12 +43,15 @@ export interface RenderApiClient {
 export class RenderApi extends Context.Service<
   RenderApi,
   Effect.Effect<RenderApiClient, RenderApiError>
->()("Render.Api") {}
+>()("Render.Api") {
+  /** Type-level marker that allows this provider service to flow into Stack. */
+  declare readonly kind: "Credentials";
+}
 
 export interface RenderApiLayerOptions {
   /** Override fetch for tests, recording, or a custom proxy. */
   readonly fetch?: typeof globalThis.fetch;
-  /** Disable the Terraform-compatible 400 requests/minute client throttle. */
+  /** Disable the baseline 400 requests/minute client throttle. */
   readonly disableRateLimit?: boolean;
 }
 
@@ -285,8 +288,9 @@ export interface RenderFetchOptions {
 
 /**
  * Render-aware fetch wrapper: one request every 150ms (400/minute), honors
- * Retry-After, and bounds retries. Unsafe POST/PATCH requests are never
- * replayed automatically, including after transport, 429, or 5xx failures.
+ * rate-limit reset headers, and bounds retries. A 429 explicitly rejects the
+ * request and is retried for every method as Render recommends. Unsafe
+ * POST/PATCH requests are not replayed after transport or 5xx failures.
  */
 export const createRenderFetch = (
   options: RenderFetchOptions = {},
@@ -345,17 +349,22 @@ export const createRenderFetch = (
       }
 
       const retryableStatus =
-        safeMethod &&
-        (response.status === 429 || [502, 503, 504].includes(response.status));
+        response.status === 429 ||
+        (safeMethod && [502, 503, 504].includes(response.status));
       if (!retryableStatus || attempt >= backoffSeconds.length) return response;
 
+      const current = now();
       const retryAfter = parseRetryAfter(
         response.headers.get("retry-after"),
-        now(),
+        current,
+      );
+      const rateLimitReset = parseRateLimitReset(
+        response.headers.get("ratelimit-reset"),
+        current,
       );
       await response.body?.cancel().catch(() => undefined);
       await pause(
-        retryAfter ?? backoffSeconds[attempt]! * 1_000,
+        retryAfter ?? rateLimitReset ?? backoffSeconds[attempt]! * 1_000,
         original.signal,
       );
     }
@@ -364,6 +373,8 @@ export const createRenderFetch = (
 
 const normalizeBaseUrl = (url: string): string => url.replace(/\/+$/, "");
 
+const MAX_RATE_LIMIT_DELAY_MS = 60 * 60 * 1_000;
+
 const parseRetryAfter = (
   value: string | null,
   now: number,
@@ -371,11 +382,23 @@ const parseRetryAfter = (
   if (!value) return undefined;
   const seconds = Number(value);
   if (Number.isFinite(seconds) && seconds >= 0)
-    return Math.min(seconds * 1_000, 120_000);
+    return Math.min(seconds * 1_000, MAX_RATE_LIMIT_DELAY_MS);
   const date = Date.parse(value);
   return Number.isNaN(date)
     ? undefined
-    : Math.min(Math.max(0, date - now), 120_000);
+    : Math.min(Math.max(0, date - now), MAX_RATE_LIMIT_DELAY_MS);
+};
+
+const parseRateLimitReset = (
+  value: string | null,
+  now: number,
+): number | undefined => {
+  if (!value) return undefined;
+  const reset = Number(value);
+  if (!Number.isFinite(reset) || reset < 0) return undefined;
+  const milliseconds =
+    reset > now / 1_000 - 60 ? reset * 1_000 - now : reset * 1_000;
+  return Math.min(Math.max(0, milliseconds), MAX_RATE_LIMIT_DELAY_MS);
 };
 
 const safeRequestId = (value: string | null): string | undefined =>

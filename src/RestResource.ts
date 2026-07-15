@@ -12,8 +12,8 @@ import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import {
   RenderApi,
+  RenderApiError,
   type RenderApiClient,
-  type RenderApiError,
 } from "./Api/Api.js";
 
 export interface CommonAttributes {
@@ -41,7 +41,16 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     props: Props,
     identity: string,
     ownerId: string,
-  ) => Readonly<Record<string, string | number | boolean | undefined>>;
+  ) => Readonly<
+    Record<
+      string,
+      | string
+      | number
+      | boolean
+      | readonly (string | number | boolean)[]
+      | undefined
+    >
+  >;
   readonly list?: (
     api: RenderApiClient,
   ) => Effect.Effect<Attrs[], RenderApiError>;
@@ -62,6 +71,11 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     output: Attrs,
     api: RenderApiClient,
   ) => Effect.Effect<boolean, RenderApiError>;
+  readonly validate?: (
+    news: Props,
+    observed: Attrs | undefined,
+    olds?: Props,
+  ) => Effect.Effect<void, RenderApiError>;
   /** Run finalize during reconcile even when the core object needs no write. */
   readonly reconcileOnNoop?: boolean;
   readonly replaceWhen?: (olds: Props, news: Props, output: Attrs) => boolean;
@@ -82,13 +96,19 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     props: Props,
     identity: string,
     ownerId: string,
+    previous?: Attrs,
   ) => unknown;
   readonly compareBody?: (
     props: Props,
     identity: string,
     ownerId: string,
+    previous?: Attrs,
   ) => unknown;
   readonly observe?: (entity: Record<string, unknown>) => unknown;
+  readonly writeEntity?: (
+    value: unknown,
+    props: Props,
+  ) => Record<string, unknown>;
   readonly attributes?: (
     entity: Record<string, unknown>,
     fallback: {
@@ -100,6 +120,11 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     },
   ) => Attrs;
   readonly afterWrite?: (attrs: Attrs, props: Props) => Attrs;
+  readonly afterDelete?: (
+    attrs: Attrs,
+    props: Props,
+    api: RenderApiClient,
+  ) => Effect.Effect<void, RenderApiError>;
   readonly finalize?: (
     attrs: Attrs,
     props: Props,
@@ -123,6 +148,9 @@ const firstString = (
 };
 
 export const unwrapEntity = (value: unknown): Record<string, unknown> => {
+  if (Array.isArray(value)) {
+    return value.length === 0 ? {} : unwrapEntity(value[0]);
+  }
   const root = record(value);
   if (!root) return {};
   if (
@@ -298,6 +326,8 @@ export const restProvider = <
       ) =>
         Effect.gen(function* () {
           let cursor: string | undefined;
+          let found: Record<string, unknown> | undefined;
+          let foundId: string | undefined;
           for (;;) {
             const data = yield* api.request({
               method: "GET",
@@ -309,21 +339,37 @@ export const restProvider = <
                   : { cursor }),
                 ...(descriptor.ownerScoped === false
                   ? {}
-                  : { ownerId: api.ownerId }),
+                  : { ownerId: [api.ownerId] }),
                 ...(!descriptor.lookupByList &&
                 descriptor.nameFilter !== false &&
                 (descriptor.identity === "name" ||
                   descriptor.identity === undefined)
-                  ? { name: identity }
+                  ? { name: [identity] }
                   : {}),
                 ...descriptor.lookupQuery?.(props, identity, api.ownerId),
               },
             });
             const rows = unwrapRows(data);
-            const found = rows.find(({ entity }) =>
-              entityMatches(entity, identity, props),
-            )?.entity;
-            if (found) return found;
+            for (const { entity } of rows) {
+              if (!entityMatches(entity, identity, props)) continue;
+              const entityId = firstString(entity, [
+                "id",
+                "resourceId",
+                "serviceId",
+              ]);
+              if (
+                found !== undefined &&
+                (entityId === undefined || entityId !== foundId)
+              ) {
+                return yield* Effect.fail(
+                  new RenderApiError(
+                    "Render lookup matched multiple resources; use a unique physical name",
+                  ),
+                );
+              }
+              found = entity;
+              foundId = entityId;
+            }
             const next = rows.at(-1)?.cursor;
             if (
               descriptor.paginated === false ||
@@ -331,7 +377,7 @@ export const restProvider = <
               next === cursor ||
               rows.length === 0
             )
-              return undefined;
+              return found;
             cursor = next;
           }
         });
@@ -381,7 +427,7 @@ export const restProvider = <
                         : { cursor }),
                       ...(descriptor.ownerScoped === false
                         ? {}
-                        : { ownerId: api.ownerId }),
+                        : { ownerId: [api.ownerId] }),
                     },
                   });
                   const rows = unwrapRows(data);
@@ -542,15 +588,26 @@ export const restProvider = <
             }
           }
           if (!output) return undefined;
+          yield* descriptor.validate?.(
+            resolvedNews,
+            output,
+            resolvedOlds,
+          ) ?? Effect.void;
           if (
-            resolvedOlds !== undefined &&
-            descriptor.replaceWhen?.(resolvedOlds, resolvedNews, output)
+            descriptor.replaceWhen?.(
+              resolvedOlds ?? resolvedNews,
+              resolvedNews,
+              output,
+            )
           ) {
             return { action: "replace" as const };
           }
           if (
-            resolvedOlds !== undefined &&
-            descriptor.sensitiveChanged?.(resolvedOlds, resolvedNews, output)
+            descriptor.sensitiveChanged?.(
+              resolvedOlds ?? resolvedNews,
+              resolvedNews,
+              output,
+            )
           ) {
             return { action: "update" as const };
           }
@@ -558,11 +615,32 @@ export const restProvider = <
           const identity = output.id;
           const liveEntity = yield* getEntity(api, identity, resolvedNews);
           if (!liveEntity) return { action: "update" as const };
+          const liveAttributes = makeAttrs(liveEntity, {
+            id: output.id,
+            identity,
+            ownerId: api.ownerId,
+            previous: output,
+            props: resolvedNews,
+          });
+          yield* descriptor.validate?.(
+            resolvedNews,
+            liveAttributes,
+            resolvedOlds,
+          ) ?? Effect.void;
+          if (
+            descriptor.sensitiveChanged?.(
+              resolvedOlds ?? resolvedNews,
+              resolvedNews,
+              liveAttributes,
+            )
+          ) {
+            return { action: "update" as const };
+          }
           if (
             descriptor.remoteSensitiveChanged &&
             (yield* descriptor.remoteSensitiveChanged(
               resolvedNews,
-              output,
+              liveAttributes,
               api,
             ))
           ) {
@@ -581,7 +659,7 @@ export const restProvider = <
             descriptor.compareBody ??
             descriptor.updateBody ??
             descriptor.body
-          )(resolvedNews, bodyIdentity, api.ownerId);
+          )(resolvedNews, bodyIdentity, api.ownerId, liveAttributes);
           const observed = descriptor.observe
             ? descriptor.observe(liveEntity)
             : liveEntity;
@@ -597,11 +675,13 @@ export const restProvider = <
           const props = news as R["Props"];
           const previousProps =
             olds === undefined ? undefined : (olds as R["Props"]);
-          const sensitiveNeedsWrite =
+          let sensitiveNeedsWrite =
             output !== undefined &&
-            previousProps !== undefined &&
-            descriptor.sensitiveChanged?.(previousProps, props, output) ===
-              true;
+            descriptor.sensitiveChanged?.(
+              previousProps ?? props,
+              props,
+              output,
+            ) === true;
           const identity = yield* descriptor.resolveIdentity?.(id, props) ??
             physicalIdentity(
               id,
@@ -622,6 +702,30 @@ export const restProvider = <
               output?.id ??
               identity)
             : undefined;
+          const observedAttributes = liveEntity
+            ? makeAttrs(liveEntity, {
+                id: existingId ?? identity,
+                identity,
+                ownerId: api.ownerId,
+                props,
+                ...(output === undefined ? {} : { previous: output }),
+              })
+            : output;
+          yield* descriptor.validate?.(
+            props,
+            observedAttributes,
+            previousProps,
+          ) ?? Effect.void;
+          if (
+            observedAttributes !== undefined &&
+            descriptor.sensitiveChanged?.(
+              previousProps ?? props,
+              props,
+              observedAttributes,
+            )
+          ) {
+            sensitiveNeedsWrite = true;
+          }
           const bodyIdentity =
             desiredIdentity(props as Record<string, unknown>) ??
             output?.name ??
@@ -630,22 +734,19 @@ export const restProvider = <
             existingId
               ? (descriptor.updateBody ?? descriptor.body)
               : descriptor.body
-          )(props, bodyIdentity, api.ownerId);
+          )(props, bodyIdentity, api.ownerId, observedAttributes);
           if (
             liveEntity &&
             output === undefined &&
             descriptor.existingSatisfies?.(liveEntity, props)
           ) {
             return yield* finalize(
-              makeAttrs(liveEntity, {
-                id: existingId ?? identity,
-                identity,
-                ownerId: api.ownerId,
-                props,
-              }),
+              observedAttributes!,
               props,
               api,
-              "read",
+              descriptor.reconcileOnNoop && sensitiveNeedsWrite
+                ? "reconcile"
+                : "read",
             );
           }
           if (
@@ -660,25 +761,26 @@ export const restProvider = <
               descriptor.compareBody ??
               (existingId ? descriptor.updateBody : undefined) ??
               descriptor.body
-            )(props, bodyIdentity, api.ownerId);
+            )(
+              props,
+              bodyIdentity,
+              api.ownerId,
+              observedAttributes,
+            );
             if (matchesDesired(observed, comparable)) {
               return yield* finalize(
-                makeAttrs(liveEntity, {
-                  id: existingId ?? identity,
-                  identity,
-                  ownerId: api.ownerId,
-                  props,
-                  ...(output === undefined ? {} : { previous: output }),
-                }),
+                observedAttributes!,
                 props,
                 api,
-                descriptor.reconcileOnNoop && output !== undefined
+                descriptor.reconcileOnNoop &&
+                (output !== undefined || sensitiveNeedsWrite)
                   ? "reconcile"
                   : "read",
               );
             }
           }
           let writeId = existingId;
+          let recoveredCreate = false;
           const data = yield* api
             .request({
               method: writeId
@@ -692,7 +794,12 @@ export const restProvider = <
             })
             .pipe(
               Effect.catch((error: RenderApiError) => {
-                if (writeId) return Effect.fail(error);
+                if (
+                  writeId ||
+                  (error.status !== undefined && error.status < 500)
+                ) {
+                  return Effect.fail(error);
+                }
                 const observe =
                   canList || descriptor.lookupByList
                     ? lookupEntity(api, identity, props)
@@ -706,26 +813,34 @@ export const restProvider = <
                         "serviceId",
                         "resourceId",
                       ]) ?? identity;
-                    return api.request({
-                      method: descriptor.updateMethod ?? "PATCH",
-                      path: descriptor.item(writeId, props),
-                      body: (descriptor.updateBody ?? descriptor.body)(
-                        props,
-                        bodyIdentity,
-                        api.ownerId,
-                      ),
-                    });
+                    recoveredCreate = true;
+                    return Effect.succeed(conflict);
                   }),
                 );
               }),
             );
-          const result = makeAttrs(unwrapEntity(data), {
-            id: writeId ?? identity,
-            identity,
-            ownerId: api.ownerId,
-            props,
-            ...(output === undefined ? {} : { previous: output }),
-          });
+          const result = makeAttrs(
+            descriptor.writeEntity?.(data, props) ?? unwrapEntity(data),
+            {
+              id: writeId ?? identity,
+              identity,
+              ownerId: api.ownerId,
+              props,
+              ...(observedAttributes === undefined
+                ? {}
+                : { previous: observedAttributes }),
+            },
+          );
+          if (recoveredCreate) {
+            return yield* finalize(
+              descriptor.afterWrite
+                ? descriptor.afterWrite(result, props)
+                : result,
+              props,
+              api,
+              "create",
+            );
+          }
           return yield* finalize(
             descriptor.afterWrite
               ? descriptor.afterWrite(result, props)
@@ -749,6 +864,7 @@ export const restProvider = <
                 error.isNotFound ? Effect.void : Effect.fail(error),
               ),
             );
+          yield* descriptor.afterDelete?.(output, props, api) ?? Effect.void;
         }),
       });
     }),
@@ -782,3 +898,48 @@ export const digest = (value: Redacted.Redacted<string>): string =>
 
 export const reveal = (value: Redacted.Redacted<string>): string =>
   Redacted.value(value);
+
+/** Move a Render resource between project environments without replacing it. */
+export const moveEnvironmentResource = (
+  api: RenderApiClient,
+  resourceId: string,
+  currentEnvironmentId: string | undefined,
+  desiredEnvironmentId: string | undefined,
+): Effect.Effect<void, RenderApiError> =>
+  currentEnvironmentId === desiredEnvironmentId
+    ? Effect.void
+    : Effect.gen(function* () {
+        // Validate the destination before detaching from the current
+        // environment. The membership API has no atomic move operation.
+        if (desiredEnvironmentId !== undefined) {
+          yield* api.request({
+            method: "GET",
+            path: `/environments/${encodeURIComponent(desiredEnvironmentId)}`,
+          });
+        }
+        if (currentEnvironmentId !== undefined) {
+          yield* api
+            .request({
+              method: "DELETE",
+              path: `/environments/${encodeURIComponent(
+                currentEnvironmentId,
+              )}/resources`,
+              query: { resourceIds: [resourceId] },
+            })
+            .pipe(
+              Effect.asVoid,
+              Effect.catch((error) =>
+                error.isNotFound ? Effect.void : Effect.fail(error),
+              ),
+            );
+        }
+        if (desiredEnvironmentId !== undefined) {
+          yield* api.request({
+            method: "POST",
+            path: `/environments/${encodeURIComponent(
+              desiredEnvironmentId,
+            )}/resources`,
+            body: { resourceIds: [resourceId] },
+          });
+        }
+      });

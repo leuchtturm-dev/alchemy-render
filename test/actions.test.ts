@@ -3,10 +3,15 @@ import { Stack, type StackSpec } from "alchemy/Stack";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
-import { RecoverPostgres, RunTask } from "../src/Actions.js";
-import { RenderApi, layer as apiLayer } from "../src/Api/Api.js";
+import {
+  Deploy,
+  RecoverPostgres,
+  RestoreDiskSnapshot,
+  RunTask,
+  type DeployProps,
+} from "../src/Actions.js";
+import { layer as apiLayer } from "../src/Api/Api.js";
 import { fromApiKey } from "../src/Credentials.js";
-import { Providers } from "../src/Providers.js";
 
 const runPromise = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.runPromise(effect as Effect.Effect<A, E>);
@@ -17,32 +22,62 @@ const json = (body: unknown, status = 200) =>
     headers: { "content-type": "application/json" },
   });
 
-const withApi = (fetch: typeof globalThis.fetch) =>
+const withApiAt = (
+  fetch: typeof globalThis.fetch,
+  ownerId: string,
+  apiBaseUrl: string,
+) =>
   apiLayer({ fetch, disableRateLimit: true }).pipe(
     Layer.provide(
-      fromApiKey({
-        apiKey: "test-key",
-        ownerId: "tea-test",
-        apiBaseUrl: "https://render.invalid/v1",
-      }),
+      fromApiKey({ apiKey: "test-key", ownerId, apiBaseUrl }),
     ),
   );
 
-const withProviders = (fetch: typeof globalThis.fetch) =>
-  Layer.effect(
-    Providers,
-    Effect.gen(function* () {
-      const renderApi = yield* RenderApi;
-      return {
-        kind: "ProviderCollection" as const,
-        get: () => undefined,
-        providers: {},
-        renderApi,
-      };
-    }),
-  ).pipe(Layer.provide(withApi(fetch)));
+const withApi = (fetch: typeof globalThis.fetch) =>
+  withApiAt(fetch, "tea-test", "https://render.invalid/v1");
 
 describe("at-least-once Actions", () => {
+  it("resolves credentials per execution instead of caching the first stack", async () => {
+    const urls: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      urls.push(new Request(input, init).url);
+      return json({ id: "dep-1", status: "created" }, 201);
+    }) as typeof globalThis.fetch;
+
+    const run = (suffix: string) => {
+      const stack: Omit<StackSpec, "output"> = {
+        name: `test-${suffix}`,
+        stage: "test",
+        resources: {},
+        bindings: {},
+        actions: {},
+      };
+      const input = { serviceId: "srv-1" };
+      return runPromise(
+        Effect.gen(function* () {
+          yield* Deploy(`deploy-${suffix}`, input);
+          return yield* stack.actions[`deploy-${suffix}`]!.Run(input);
+        }).pipe(
+          Effect.provideService(Stack, stack),
+          Effect.provide(
+            withApiAt(
+              fetch,
+              `tea-${suffix}`,
+              `https://${suffix}.render.invalid/v1`,
+            ),
+          ),
+        ),
+      );
+    };
+
+    await run("one");
+    await run("two");
+    expect(urls).toEqual([
+      "https://one.render.invalid/v1/services/srv-1/deploys",
+      "https://two.render.invalid/v1/services/srv-1/deploys",
+    ]);
+  });
+
   it("uses the documented Postgres recovery path and secret field casing", async () => {
     let request: Request | undefined;
     let body: unknown;
@@ -73,7 +108,7 @@ describe("at-least-once Actions", () => {
         return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
-        Effect.provide(withProviders(fetch)),
+        Effect.provide(withApi(fetch)),
       ),
     );
 
@@ -121,12 +156,77 @@ describe("at-least-once Actions", () => {
         return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
-        Effect.provide(withProviders(fetch)),
+        Effect.provide(withApi(fetch)),
       ),
     );
     expect(body).toEqual({
       task: "workflow/send-email",
       input: { recipient: "secret@example.com" },
+    });
+  });
+
+  it("rejects deployMode combined with a commit, image, or cache selector", async () => {
+    let calls = 0;
+    const fetch = (async () => {
+      calls++;
+      return json({});
+    }) as typeof globalThis.fetch;
+    const input = {
+      serviceId: "srv-1",
+      deployMode: "deploy_only",
+      clearCache: "clear",
+    } as unknown as DeployProps;
+    const stack: Omit<StackSpec, "output"> = {
+      name: "test",
+      stage: "test",
+      resources: {},
+      bindings: {},
+      actions: {},
+    };
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          yield* Deploy("invalid-deploy", input);
+          return yield* stack.actions["invalid-deploy"]!.Run(input);
+        }).pipe(
+          Effect.provideService(Stack, stack),
+          Effect.provide(withApi(fetch)),
+        ),
+      ),
+    ).rejects.toThrow("deployMode cannot be combined");
+    expect(calls).toBe(0);
+  });
+
+  it("passes the optional disk instance selector to snapshot restore", async () => {
+    let body: unknown;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      body = await new Request(input, init).json();
+      return json({ id: "dsk-1" });
+    }) as typeof globalThis.fetch;
+    const input = {
+      diskId: "dsk-1",
+      snapshotKey: "2026-07-15T12:00:00Z",
+      instanceId: "srv-1-abc",
+    };
+    const stack: Omit<StackSpec, "output"> = {
+      name: "test",
+      stage: "test",
+      resources: {},
+      bindings: {},
+      actions: {},
+    };
+    await runPromise(
+      Effect.gen(function* () {
+        yield* RestoreDiskSnapshot("restore-disk", input);
+        return yield* stack.actions["restore-disk"]!.Run(input);
+      }).pipe(
+        Effect.provideService(Stack, stack),
+        Effect.provide(withApi(fetch)),
+      ),
+    );
+    expect(body).toEqual({
+      snapshotKey: "2026-07-15T12:00:00Z",
+      instanceId: "srv-1-abc",
     });
   });
 });

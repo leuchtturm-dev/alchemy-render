@@ -1,7 +1,8 @@
 import * as Action from "alchemy/Action";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { apiFromProviders, Providers } from "./Providers.js";
+import { RenderApi, RenderApiError } from "./Api/Api.js";
+import type { ServicePlan } from "./Services.js";
 
 /** Render actions have at-least-once execution semantics. */
 
@@ -21,12 +22,25 @@ interface MaintenanceProps {
   readonly maintenanceRunId: string;
 }
 
-export interface DeployProps extends ServiceProps {
+interface DeployTargetProps extends ServiceProps {
   readonly clearCache?: "clear" | "do_not_clear";
   readonly commitId?: string;
   readonly imageUrl?: string;
-  readonly deployMode?: "deploy_only" | "build_and_deploy";
+  readonly deployMode?: never;
 }
+
+interface DeployModeProps extends ServiceProps {
+  readonly deployMode: "deploy_only" | "build_and_deploy";
+  readonly clearCache?: never;
+  readonly commitId?: never;
+  readonly imageUrl?: never;
+}
+
+/**
+ * Trigger a deploy. Render does not allow `deployMode` to be combined with a
+ * cache, commit, or image selector.
+ */
+export type DeployProps = DeployTargetProps | DeployModeProps;
 export interface RollbackProps extends ServiceProps {
   readonly deployId: string;
 }
@@ -43,7 +57,7 @@ export interface ScaleServiceProps extends ServiceProps {
 export interface PreviewServiceProps extends ServiceProps {
   readonly imagePath: string;
   readonly name?: string;
-  readonly plan?: string;
+  readonly plan?: ServicePlan;
 }
 export interface VerifyCustomDomainProps extends ServiceProps {
   readonly domainNameOrId: string;
@@ -64,6 +78,8 @@ export interface CancelCronJobRunProps {
 export interface RestoreDiskSnapshotProps {
   readonly diskId: string;
   readonly snapshotKey: string;
+  /** Select the instance snapshot when the disk belongs to a scaled service. */
+  readonly instanceId?: string;
 }
 export interface SuspendPostgresProps extends PostgresProps {}
 export interface ResumePostgresProps extends PostgresProps {}
@@ -78,9 +94,12 @@ export interface RecoverPostgresProps extends PostgresProps {
   readonly datadogSite?: string;
 }
 export interface ExportPostgresProps extends PostgresProps {}
-export interface RotatePostgresCredentialsProps extends PostgresProps {
+export interface CreatePostgresUserProps extends PostgresProps {
   readonly username: string;
 }
+/** @deprecated Use `CreatePostgresUserProps`. */
+export interface RotatePostgresCredentialsProps
+  extends CreatePostgresUserProps {}
 export interface DeletePostgresUserProps extends PostgresProps {
   readonly username: string;
 }
@@ -143,22 +162,27 @@ const operation = <const Type extends string, Props extends object>(
   method: Method,
   path: (props: Props) => string,
   body?: (props: Props) => unknown,
+  validate?: (props: Props) => string | undefined,
 ) =>
-  Action.Action<Type, Props, AcceptedResult, Providers>(
+  Action.Action<Type, Props, AcceptedResult, RenderApi>(
     type,
-    Effect.gen(function* () {
-      const getApi = yield* apiFromProviders;
-      return (props) =>
-        Effect.gen(function* () {
-          const api = yield* getApi;
-          const value = yield* api.request({
-            method,
-            path: path(props),
-            ...(body === undefined ? {} : { body: body(props) }),
-          });
-          return result(value);
+    (props) =>
+      Effect.gen(function* () {
+        const validationError = validate?.(props);
+        if (validationError !== undefined) {
+          return yield* Effect.fail(new RenderApiError(validationError));
+        }
+        // Resolve the API at execution time. Alchemy caches baked Action init
+        // Effects process-wide, which must not capture one stack's profile.
+        const getApi = yield* RenderApi;
+        const api = yield* getApi;
+        const value = yield* api.request({
+          method,
+          path: path(props),
+          ...(body === undefined ? {} : { body: body(props) }),
         });
-    }),
+        return result(value);
+      }),
   );
 
 export const Deploy = operation(
@@ -166,6 +190,13 @@ export const Deploy = operation(
   "POST",
   (p: DeployProps) => `/services/${encode(p.serviceId)}/deploys`,
   ({ serviceId: _, ...body }) => body,
+  (p) =>
+    p.deployMode !== undefined &&
+    (p.clearCache !== undefined ||
+      p.commitId !== undefined ||
+      p.imageUrl !== undefined)
+      ? "Render deployMode cannot be combined with clearCache, commitId, or imageUrl"
+      : undefined,
 );
 export const Rollback = operation(
   "Render.Rollback",
@@ -204,6 +235,12 @@ export const ScaleService = operation(
   "POST",
   (p: ScaleServiceProps) => `/services/${encode(p.serviceId)}/scale`,
   (p) => ({ numInstances: p.numInstances }),
+  (p) =>
+    Number.isInteger(p.numInstances) &&
+    p.numInstances >= 1 &&
+    p.numInstances <= 100
+      ? undefined
+      : "Render numInstances must be an integer from 1 to 100",
 );
 export const PreviewService = operation(
   "Render.PreviewService",
@@ -251,7 +288,10 @@ export const RestoreDiskSnapshot = operation(
   "POST",
   (p: RestoreDiskSnapshotProps) =>
     `/disks/${encode(p.diskId)}/snapshots/restore`,
-  (p) => ({ snapshotKey: p.snapshotKey }),
+  (p) => ({
+    snapshotKey: p.snapshotKey,
+    ...(p.instanceId === undefined ? {} : { instanceId: p.instanceId }),
+  }),
 );
 export const SuspendPostgres = operation(
   "Render.SuspendPostgres",
@@ -290,6 +330,14 @@ export const ExportPostgres = operation(
   "POST",
   (p: ExportPostgresProps) => `/postgres/${encode(p.postgresId)}/export`,
 );
+export const CreatePostgresUser = operation(
+  "Render.CreatePostgresUser",
+  "POST",
+  (p: CreatePostgresUserProps) =>
+    `/postgres/${encode(p.postgresId)}/credentials`,
+  (p) => ({ username: p.username }),
+);
+/** @deprecated Use `CreatePostgresUser`. */
 export const RotatePostgresCredentials = operation(
   "Render.RotatePostgresCredentials",
   "POST",

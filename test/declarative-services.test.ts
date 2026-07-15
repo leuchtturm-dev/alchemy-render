@@ -8,6 +8,7 @@ import { fromApiKey } from "../src/Credentials.js";
 import {
   WebService,
   WebServiceProvider,
+  type ImageSource,
   type ServiceAttributes,
   type WebServiceProps,
 } from "../src/Services.js";
@@ -52,7 +53,7 @@ const reconcileInput = (
 const imageProps = (
   env: WebServiceProps["env"],
   options: Pick<WebServiceProps, "numInstances" | "waitForDeploy"> = {},
-): WebServiceProps => ({
+): WebServiceProps & ImageSource => ({
   name: "api",
   runtime: "image",
   image: { imagePath: "docker.io/acme/api:1" },
@@ -446,5 +447,167 @@ describe("declarative service-owned configuration", () => {
     );
 
     expect(paths).toContain("GET /v1/services/srv-1/deploys/dep-update");
+  });
+
+  it("moves a service between environments without replacing it", async () => {
+    const oldProps: WebServiceProps & ImageSource = {
+      ...imageProps(undefined),
+      environmentId: "evm-old",
+    };
+    const newProps: WebServiceProps & ImageSource = {
+      ...oldProps,
+      environmentId: "evm-new",
+    };
+    const remote = { ...service(), environmentId: "evm-old" };
+    const requests: Array<{ method: string; path: string; body?: unknown }> = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      const text = request.method === "GET" ? "" : await request.text();
+      const body = text.length === 0 ? undefined : JSON.parse(text);
+      requests.push({ method: request.method, path, body });
+      if (request.method === "GET") return json(remote);
+      if (path.endsWith("/deploys")) {
+        return json({ id: "dep-environment", status: "created" }, 201);
+      }
+      return json({});
+    }) as typeof globalThis.fetch;
+    const output: ServiceAttributes & { readonly type: "web_service" } = {
+      id: "srv-1",
+      serviceId: "srv-1",
+      type: "web_service",
+      name: "api",
+      ownerId: "tea-test",
+      environmentId: "evm-old",
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* WebService.Provider;
+        return yield* provider.reconcile(
+          reconcileInput(newProps, output, oldProps),
+        );
+      }).pipe(
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(result.environmentId).toBe("evm-new");
+    expect(requests.map(({ method, path }) => `${method} ${path}`)).toEqual([
+      "GET /v1/services/srv-1",
+      "GET /v1/environments/evm-new",
+      "DELETE /v1/environments/evm-old/resources",
+      "POST /v1/environments/evm-new/resources",
+      "POST /v1/services/srv-1/deploys",
+    ]);
+    expect(requests[2]?.body).toBeUndefined();
+    expect(requests[3]?.body).toEqual({ resourceIds: ["srv-1"] });
+  });
+
+  it("repairs out-of-band service environment drift", async () => {
+    const props: WebServiceProps & ImageSource = {
+      ...imageProps(undefined),
+      environmentId: "evm-desired",
+    };
+    const remote = { ...service(), environmentId: "evm-external" };
+    const requests: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (request.method === "GET") return json(remote);
+      if (path.endsWith("/deploys")) {
+        return json({ id: "dep-drift", status: "created" }, 201);
+      }
+      return json({});
+    }) as typeof globalThis.fetch;
+    const output: ServiceAttributes & { readonly type: "web_service" } = {
+      id: "srv-1",
+      serviceId: "srv-1",
+      type: "web_service",
+      name: "api",
+      ownerId: "tea-test",
+      environmentId: "evm-desired",
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* WebService.Provider;
+        return yield* provider.reconcile(
+          reconcileInput(props, output, props),
+        );
+      }).pipe(
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(result.environmentId).toBe("evm-desired");
+    expect(requests).toEqual([
+      "GET /v1/services/srv-1",
+      "GET /v1/environments/evm-desired",
+      "DELETE /v1/environments/evm-external/resources",
+      "POST /v1/environments/evm-desired/resources",
+      "POST /v1/services/srv-1/deploys",
+    ]);
+  });
+
+  it("conservatively deploys a cold-adopted web cache transition", async () => {
+    const props: WebServiceProps & ImageSource = {
+      ...imageProps(undefined),
+      cache: { profile: "origin-controlled" },
+    };
+    const remote = {
+      ...service(),
+      serviceDetails: {
+        ...service().serviceDetails,
+        cache: { profile: "origin-controlled" },
+      },
+    };
+    const requests: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (request.method === "GET" && path.endsWith("/services")) {
+        return json([{ service: remote }]);
+      }
+      if (request.method === "GET") return json(remote);
+      if (request.method === "POST" && path.endsWith("/deploys")) {
+        return json({ id: "dep-recovery", status: "created" }, 201);
+      }
+      return json({ message: "unexpected request" }, 500);
+    }) as typeof globalThis.fetch;
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* WebService.Provider;
+        const cold = yield* provider.read!({
+          id: "Api",
+          fqn: "Api",
+          instanceId: "00112233445566778899aabbccddeeff",
+          olds: props,
+          output: undefined,
+        });
+        expect(cold?.coreDigest).toBeUndefined();
+        const adopted = { ...cold! };
+        return yield* provider.reconcile({
+          ...reconcileInput(props, adopted),
+          olds: undefined,
+        });
+      }).pipe(
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(result.deployId).toBe("dep-recovery");
+    expect(requests.filter((request) => request.endsWith("/deploys"))).toEqual([
+      "POST /v1/services/srv-1/deploys",
+    ]);
   });
 });

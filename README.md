@@ -77,14 +77,13 @@ For tests or embedding, `Render.fromApiKey({ apiKey, ownerId, apiBaseUrl? })` pr
 
 ## Ownership and adoption
 
-`WebService`, `PrivateService`, and `BackgroundWorker` can own two aggregate configuration surfaces directly:
+All five service Resources can own `env` as their complete service environment. It accepts a readonly record of `Redacted<string>` values. An explicit empty object removes all environment variables; omitting `env` leaves environment variables unmanaged.
 
-- `env` is the complete service-owned environment. It accepts a readonly record of `Redacted<string>` values. An explicit empty object removes all environment variables; omitting `env` leaves environment variables unmanaged.
-- `numInstances` is the fixed/manual instance count. Omit it when another system manages scaling.
+`WebService`, `PrivateService`, and `BackgroundWorker` can additionally own `numInstances` as their fixed/manual instance count. Omit it when another system manages scaling. Repository, Docker, and image sources are modeled as a discriminated union, so incompatible or incomplete source combinations fail typechecking.
 
-Other independently addressable configuration remains available through standalone Resources: secret files, custom domains, disks, static-site headers and routes, autoscaling, environment links, log streams, and notification overrides.
+Other independently addressable configuration remains available through standalone Resources: secret files, custom domains, disks, static-site headers and routes, autoscaling, environment links, log streams, and notification overrides. Changing a resource's high-level `environmentId` moves it through Render's environment membership API instead of replacing it.
 
-Do not mix service-owned `env` with `ServiceEnvVar` for the same service: aggregate reconciliation uses Render's replace-all endpoint and can delete independently managed keys. Likewise, do not combine service-owned `numInstances` with `Autoscaling` or an independently invoked `ScaleService` Action. Low-level Resources and Actions remain available when the high-level property is omitted.
+Do not mix service-owned `env` with `ServiceEnvVar` for the same service: aggregate reconciliation uses Render's replace-all endpoint and can delete independently managed keys. A standalone `ServiceEnvVar` or `ServiceSecretFile` starts a deployment after each write or delete because Render's configuration endpoints do not deploy changes automatically. Creating or updating a `Disk` also deploys its attached service, as required for the attachment or change to take effect. Likewise, do not combine service-owned `numInstances` with `Autoscaling` or an independently invoked `ScaleService` Action. Low-level Resources and Actions remain available when the high-level property is omitted.
 
 Do not let two stacks—or a Resource and another tool—authoritatively manage the same child object. Header and route field changes replace the rule because headers have no item-update endpoint and route PATCH only changes priority. Workflow environment variables are create-only in the API, so adding, removing, or rotating one replaces the Workflow.
 
@@ -104,13 +103,13 @@ On updates, the service provider owns the complete transition: it reconciles the
 
 Reconciliation does not poll by default. Set `waitForDeploy: true` to poll only the concrete deployment created by that reconciliation until it reaches `live`; `deployTimeoutMs` defaults to three hours. Consumer stacks never need deployment polling.
 
-Use the explicit `Deploy` Action only for genuinely imperative operations: deploying a specific commit or image, forcing a rebuild, or clearing build cache. Ordinary service and environment changes do not need an Action. Because Render's create contract does not accept web-cache settings, a requested `cache` profile is applied immediately after creation and the provider deploys the resulting configuration.
+Use the explicit `Deploy` Action only for genuinely imperative operations: deploying a specific commit or image, forcing a rebuild, or clearing build cache. `deployMode` is mutually exclusive with commit, image, and cache selectors, matching Render's request contract. Ordinary service and environment changes do not need an Action. Because Render's create contract does not accept web-cache settings, a requested `cache` profile is applied immediately after creation and the provider deploys the resulting configuration. A cold adoption with managed cache state conservatively deploys once when no persisted transition marker exists.
 
 ## Actions are at-least-once
 
 Alchemy Actions have no Resource-style read recovery. If a process stops after Render accepts an Action but before Alchemy persists its result, a later apply can run it again. Deploys, jobs, previews, restores, recoveries, credential rotations, exports, workflow versions, and task runs can therefore be duplicated.
 
-The transport never retries unsafe POST/PATCH requests after network or 5xx failures, but process-level replay remains possible. Use stable logical IDs, inspect Render before forcing an Action, and treat every Action as replayable.
+The transport retries explicit `429` rejections using Render's rate-limit headers, but never retries unsafe POST/PATCH requests after network or 5xx failures. Process-level replay remains possible. Use stable logical IDs, inspect Render before forcing an Action, and treat every Action as replayable.
 
 Declarative service deployment has stronger recovery than an Action: persisted core/environment digests and remote reads let a later apply finish a transition interrupted before deploy creation. Render does not document an idempotency key for `POST /deploys`, so one residual case cannot be made exactly-once: if Render accepts the deploy but the process stops before Alchemy persists the new digest/deploy ID, recovery conservatively creates another deploy. This favors completing the declared transition over silently leaving configuration undeployed.
 
@@ -132,7 +131,7 @@ Declarative service deployment has stronger recovery than an Action: persisted c
 - **Services:** `PurgeCache`, `SuspendService`, `ResumeService`, `RestartService`, `ScaleService`, `PreviewService`, `VerifyCustomDomain`
 - **Jobs:** `RunJob`, `CancelJob`, `RunCronJob`, `CancelCronJobRun`
 - **Disks:** `RestoreDiskSnapshot`
-- **Postgres:** `SuspendPostgres`, `ResumePostgres`, `RestartPostgres`, `FailoverPostgres`, `RecoverPostgres`, `ExportPostgres`, `RotatePostgresCredentials`, `DeletePostgresUser`
+- **Postgres:** `SuspendPostgres`, `ResumePostgres`, `RestartPostgres`, `FailoverPostgres`, `RecoverPostgres`, `ExportPostgres`, `CreatePostgresUser`, deprecated `RotatePostgresCredentials`, `DeletePostgresUser`
 - **Key Value / Redis:** `SuspendKeyValue`, `ResumeKeyValue`, deprecated `SuspendRedis`, `ResumeRedis`
 - **Maintenance:** `TriggerMaintenance`, `UpdateMaintenanceSchedule`
 - **Workflows and tasks:** `CreateWorkflowVersion`, `RunTask`, `CancelTaskRun`
@@ -147,7 +146,7 @@ Some API concepts intentionally are not Resources:
 - **Owner notification settings:** always exist and Render does not define a truthful delete/reset operation. Service-level overrides are managed because delete can reset both fields to `default`.
 - **Read-only observability and account data:** available through the typed API, not fake lifecycle Resources.
 
-`Redis` exists for migration and Terraform parity only. Use `KeyValue` for new stacks. Disk size is required and can only be increased by Render; a shrink request fails rather than replacing and destroying the disk. Set a stream `token` to `null` to explicitly clear it; omitting it leaves an unknown existing token unmanaged.
+`Redis` exists for migration and Terraform parity only. Use `KeyValue` for new stacks. Persistent-disk and Postgres storage can only be increased by Render; the provider rejects an explicit shrink before issuing a PATCH rather than replacing and destroying data. When Postgres disk autoscaling is enabled, growth above an unchanged declared size is treated as satisfying that minimum. Set a stream `token` to `null` to explicitly clear it; omitting it leaves an unknown existing token unmanaged.
 
 ## Typed API escape hatch
 

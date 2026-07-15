@@ -1,10 +1,15 @@
+import { createHash } from "node:crypto";
 import { Unowned } from "alchemy/AdoptPolicy";
 import { isResolved } from "alchemy/Diff";
 import * as Provider from "alchemy/Provider";
 import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { RenderApi, type RenderApiError } from "./Api/Api.js";
+import {
+  RenderApi,
+  RenderApiError,
+  type RenderApiClient,
+} from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
   resourceClass,
@@ -72,6 +77,7 @@ export interface DiskAttributes extends ServiceChildAttributes {
   readonly diskId: string;
   readonly mountPath?: string;
   readonly sizeGB?: number;
+  readonly configurationDigest?: string;
 }
 export interface AutoscalingAttributes extends CommonAttributes {
   readonly serviceId: string;
@@ -133,6 +139,26 @@ export type Autoscaling = Managed<
 >;
 export const Autoscaling = Resource.Resource<Autoscaling>("Render.Autoscaling");
 
+const deployServiceConfiguration = (
+  api: RenderApiClient,
+  serviceId: string,
+  ignoreNotFound = false,
+) =>
+  api
+    .request({
+      method: "POST",
+      path: `/services/${encodeURIComponent(serviceId)}/deploys`,
+      body: {},
+    })
+    .pipe(
+      Effect.asVoid,
+      Effect.catch((error) =>
+        ignoreNotFound && error.isNotFound
+          ? Effect.void
+          : Effect.fail(error),
+      ),
+    );
+
 const secretAttrs = (
   e: Record<string, unknown>,
   f: { id: string; previous?: SecretValueAttributes; props?: unknown },
@@ -190,6 +216,14 @@ export const ServiceEnvVarProvider = () =>
         ...(p.value ? { valueDigest: digest(p.value) } : {}),
       };
     },
+    finalize: (attributes, props, api, phase) =>
+      phase === "create" || phase === "update"
+        ? deployServiceConfiguration(api, props.serviceId).pipe(
+            Effect.as(attributes),
+          )
+        : Effect.succeed(attributes),
+    afterDelete: (_attributes, props, api) =>
+      deployServiceConfiguration(api, props.serviceId, true),
   });
 export const ServiceSecretFileProvider = () =>
   restProvider(ServiceSecretFile, {
@@ -215,6 +249,14 @@ export const ServiceSecretFileProvider = () =>
       generated: false,
       valueDigest: digest(p.content),
     }),
+    finalize: (attributes, props, api, phase) =>
+      phase === "create" || phase === "update"
+        ? deployServiceConfiguration(api, props.serviceId).pipe(
+            Effect.as(attributes),
+          )
+        : Effect.succeed(attributes),
+    afterDelete: (_attributes, props, api) =>
+      deployServiceConfiguration(api, props.serviceId, true),
   });
 const childAttrs = (
   e: Record<string, unknown>,
@@ -244,16 +286,64 @@ export const CustomDomainProvider = () =>
     immutable: ["serviceId", "name"],
     body: (_p, name) => ({ name }),
     updateBody: () => ({}),
+    writeEntity: (value, props) => {
+      if (!Array.isArray(value)) return unwrapEntity(value);
+      const match = value.find(
+        (entry): entry is Record<string, unknown> =>
+          typeof entry === "object" &&
+          entry !== null &&
+          !Array.isArray(entry) &&
+          (entry as Record<string, unknown>).name === props.name,
+      );
+      return match ?? unwrapEntity(value);
+    },
     attributes: childAttrs,
     afterWrite: (a, p) => ({ ...a, serviceId: p.serviceId }),
   });
+const diskConfigurationDigest = (
+  props: DiskProps,
+  attributes: Pick<DiskAttributes, "id" | "name">,
+) =>
+  createHash("sha256")
+    .update(
+      JSON.stringify({
+        name: props.name ?? attributes.name ?? attributes.id,
+        mountPath: props.mountPath,
+        sizeGB: props.sizeGB,
+      }),
+    )
+    .digest("hex");
+
 export const DiskProvider = () =>
   restProvider(Disk, {
     collection: "/disks",
     item: (id) => `/disks/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["diskId", "serviceId"],
+    filter: (entity, props) =>
+      props === undefined || entity.serviceId === props.serviceId,
     immutable: ["serviceId"],
+    reconcileOnNoop: true,
+    sensitiveChanged: (_olds, props, output) =>
+      output.configurationDigest !== diskConfigurationDigest(props, output),
+    validate: (props, observed) => {
+      if (!Number.isInteger(props.sizeGB) || props.sizeGB < 1) {
+        return Effect.fail(
+          new RenderApiError("Render disk sizeGB must be a positive integer"),
+        );
+      }
+      if (
+        observed?.sizeGB !== undefined &&
+        props.sizeGB < observed.sizeGB
+      ) {
+        return Effect.fail(
+          new RenderApiError(
+            `Render disks can only grow (current ${observed.sizeGB} GB, requested ${props.sizeGB} GB)`,
+          ),
+        );
+      }
+      return Effect.void;
+    },
     body: (p, name) => ({
       name,
       serviceId: p.serviceId,
@@ -277,7 +367,23 @@ export const DiskProvider = () =>
         ...(typeof e.name === "string" ? { name: e.name } : {}),
         ...(typeof e.mountPath === "string" ? { mountPath: e.mountPath } : {}),
         ...(typeof e.sizeGB === "number" ? { sizeGB: e.sizeGB } : {}),
+        ...(f.previous?.configurationDigest
+          ? { configurationDigest: f.previous.configurationDigest }
+          : {}),
       };
+    },
+    finalize: (attributes, props, api, phase) => {
+      const configurationDigest = diskConfigurationDigest(props, attributes);
+      const needsDeploy =
+        phase === "create" ||
+        phase === "update" ||
+        (phase === "reconcile" &&
+          attributes.configurationDigest !== configurationDigest);
+      return needsDeploy
+        ? deployServiceConfiguration(api, props.serviceId).pipe(
+            Effect.as({ ...attributes, configurationDigest }),
+          )
+        : Effect.succeed(attributes);
     },
   });
 export const HeaderProvider = () =>
@@ -332,6 +438,38 @@ const autoAttrs = (p: AutoscalingProps): AutoscalingAttributes => ({
   max: p.max,
   criteria: normalizeAutoscalingCriteria(p.criteria),
 });
+
+const validateAutoscaling = (props: AutoscalingProps) => {
+  if (
+    !Number.isInteger(props.min) ||
+    !Number.isInteger(props.max) ||
+    props.min < 1 ||
+    props.max > 100 ||
+    props.min > props.max
+  ) {
+    return Effect.fail(
+      new RenderApiError(
+        "Render autoscaling requires integer bounds with 1 <= min <= max <= 100",
+      ),
+    );
+  }
+  for (const [name, criterion] of Object.entries(props.criteria)) {
+    if (
+      criterion !== undefined &&
+      (!Number.isInteger(criterion.percentage) ||
+        criterion.percentage < (criterion.enabled ? 1 : 0) ||
+        criterion.percentage > 100)
+    ) {
+      return Effect.fail(
+        new RenderApiError(
+          `Render autoscaling ${name} percentage must be an integer between ${criterion.enabled ? 1 : 0} and 100`,
+        ),
+      );
+    }
+  }
+  return Effect.void;
+};
+
 export const AutoscalingProvider = () =>
   Provider.effect(
     resourceClass(Autoscaling),
@@ -381,23 +519,21 @@ export const AutoscalingProvider = () =>
         nuke: { skip: true },
         list: () => Effect.succeed([]),
         read: ({ olds, output }) => observe(olds, !!output),
-        diff: ({ olds, news, output }) =>
-          Effect.succeed(
-            !isResolved(news)
-              ? undefined
-              : olds.serviceId !== news.serviceId
-                ? { action: "replace" as const }
-                : !output ||
-                    output.min !== news.min ||
-                    output.max !== news.max ||
-                    JSON.stringify(output.criteria) !==
-                      JSON.stringify(
-                        normalizeAutoscalingCriteria(news.criteria),
-                      )
-                  ? { action: "update" as const }
-                  : undefined,
-          ),
+        diff: Effect.fn(function* ({ olds, news, output }) {
+          if (!isResolved(news)) return undefined;
+          yield* validateAutoscaling(news);
+          return olds.serviceId !== news.serviceId
+            ? { action: "replace" as const }
+            : !output ||
+                output.min !== news.min ||
+                output.max !== news.max ||
+                JSON.stringify(output.criteria) !==
+                  JSON.stringify(normalizeAutoscalingCriteria(news.criteria))
+              ? { action: "update" as const }
+              : undefined;
+        }),
         reconcile: Effect.fn(function* ({ news }) {
+          yield* validateAutoscaling(news);
           const api = yield* getApi;
           yield* api.request({
             method: "PUT",

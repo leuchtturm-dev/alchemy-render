@@ -47,6 +47,10 @@ import {
 import {
   Autoscaling,
   AutoscalingProvider,
+  CustomDomain,
+  CustomDomainProvider,
+  Disk,
+  DiskProvider,
   Route,
   RouteProvider,
   ServiceEnvVar,
@@ -767,6 +771,35 @@ describe("representative resource lifecycles", () => {
     expect(result.criteria).toEqual(body?.criteria);
   });
 
+  it("rejects invalid autoscaling bounds before issuing a request", async () => {
+    let requests = 0;
+    const fetch = (async () => {
+      requests += 1;
+      return json({});
+    }) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Autoscaling.Provider;
+          return yield* provider.reconcile(
+            reconcileInput({
+              serviceId: "srv-1",
+              min: 4,
+              max: 2,
+              criteria: { cpu: { enabled: true, percentage: 70 } },
+            }),
+          );
+        }).pipe(
+          Effect.provide(
+            AutoscalingProvider().pipe(Layer.provide(withApi(fetch))),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("1 <= min <= max <= 100");
+    expect(requests).toBe(0);
+  });
+
   it("waits for Key Value readiness before reading connection information", async () => {
     const paths: string[] = [];
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -807,6 +840,45 @@ describe("representative resource lifecycles", () => {
     expect(
       Redacted.value(result.connectionInfo!.internalConnectionString!),
     ).toContain("secret");
+  });
+
+  it("preserves connection state without querying it while suspended", async () => {
+    const paths: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      paths.push(new URL(request.url).pathname);
+      return json({ id: "kv-1", name: "cache", status: "suspended" });
+    }) as typeof globalThis.fetch;
+    const connectionInfo = {
+      internalConnectionString: Redacted.make("redis://secret@internal"),
+    };
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* KeyValue.Provider;
+        return yield* provider.read!({
+          id: "Cache",
+          fqn: "Cache",
+          instanceId: "00112233445566778899aabbccddeeff",
+          olds: {
+            name: "cache",
+            plan: "starter" as const,
+            maxmemoryPolicy: "noeviction" as const,
+          },
+          output: {
+            id: "kv-1",
+            datastoreId: "kv-1",
+            name: "cache",
+            connectionInfo,
+          },
+        });
+      }).pipe(
+        Effect.provide(KeyValueProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    expect(paths).toEqual(["/v1/key-value/kv-1"]);
+    expect(result?.connectionInfo).toBe(connectionInfo);
+    expect(result?.status).toBe("suspended");
   });
 
   it("tracks Postgres Datadog secrets by digest without perpetual drift", async () => {
@@ -1098,5 +1170,447 @@ describe("representative resource lifecycles", () => {
     expect(bodies[1]).toEqual({
       serviceDetails: { cache: { profile: "origin-controlled" } },
     });
+  });
+
+  it("keeps the physical ID returned by custom-domain creation", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "GET") return json({ message: "not found" }, 404);
+      return json([{ id: "cd-1", name: "api.example.com" }], 201);
+    }) as typeof globalThis.fetch;
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* CustomDomain.Provider;
+        return yield* provider.reconcile(
+          reconcileInput({ serviceId: "srv-1", name: "api.example.com" }),
+        );
+      }).pipe(
+        Effect.provide(
+          CustomDomainProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+    expect(methods).toEqual(["GET", "POST"]);
+    expect(result.id).toBe("cd-1");
+  });
+
+  it("deploys a service after creating or updating its disk", async () => {
+    const requests: Array<{ method: string; path: string }> = [];
+    let disk = {
+      id: "dsk-1",
+      serviceId: "srv-1",
+      name: "data",
+      mountPath: "/data",
+      sizeGB: 1,
+    };
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push({ method: request.method, path });
+      if (request.method === "GET" && path === "/v1/disks") return json([]);
+      if (request.method === "GET") return json(disk);
+      if (path.endsWith("/deploys")) {
+        return json({ id: "dep-disk", status: "created" }, 201);
+      }
+      if (request.method === "POST") return json(disk, 201);
+      if (request.method === "PATCH") {
+        disk = { ...disk, ...JSON.parse(await request.text()) };
+        return json(disk);
+      }
+      return json({}, 204);
+    }) as typeof globalThis.fetch;
+    const props = {
+      serviceId: "srv-1",
+      name: "data",
+      mountPath: "/data",
+      sizeGB: 1,
+    };
+
+    const created = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Disk.Provider;
+        return yield* provider.reconcile(reconcileInput(props));
+      }).pipe(
+        Effect.provide(DiskProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+    expect(created.configurationDigest).toHaveLength(64);
+
+    await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Disk.Provider;
+        return yield* provider.reconcile(
+          reconcileInput(props, created),
+        );
+      }).pipe(
+        Effect.provide(DiskProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    const grown = { ...props, sizeGB: 2 };
+    await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Disk.Provider;
+        return yield* provider.reconcile(
+          reconcileInput(grown, created),
+        );
+      }).pipe(
+        Effect.provide(DiskProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    expect(requests.filter(({ path }) => path.endsWith("/deploys"))).toHaveLength(
+      2,
+    );
+    expect(requests.filter(({ method }) => method === "PATCH")).toHaveLength(1);
+  });
+
+  it("rejects disk shrinkage before sending a destructive PATCH", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      return json({
+        id: "dsk-1",
+        serviceId: "srv-1",
+        name: "data",
+        mountPath: "/data",
+        sizeGB: 10,
+      });
+    }) as typeof globalThis.fetch;
+    const props = {
+      serviceId: "srv-1",
+      name: "data",
+      mountPath: "/data",
+      sizeGB: 5,
+    };
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Disk.Provider;
+          return yield* provider.reconcile(
+            reconcileInput(props, {
+              id: "dsk-1",
+              diskId: "dsk-1",
+              serviceId: "srv-1",
+              name: "data",
+              mountPath: "/data",
+              sizeGB: 10,
+            }),
+          );
+        }).pipe(
+          Effect.provide(DiskProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Render disks can only grow");
+    expect(methods).toEqual(["GET"]);
+  });
+
+  it("clears a removed Postgres Datadog integration explicitly", async () => {
+    let patchBody: Record<string, unknown> | undefined;
+    const remote = {
+      id: "dpg-1",
+      name: "db",
+      plan: "basic_1gb",
+      version: "16",
+      status: "available",
+      highAvailabilityEnabled: false,
+      diskAutoscalingEnabled: false,
+      connectionPool: "none",
+      ipAllowList: [],
+      parameterOverrides: {},
+      readReplicas: [],
+    };
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (request.method === "PATCH") {
+        patchBody = JSON.parse(await request.text());
+        return json(remote);
+      }
+      if (path.endsWith("/connection-info")) return json({});
+      return json(remote);
+    }) as typeof globalThis.fetch;
+    const props = {
+      name: "db",
+      plan: "basic_1gb" as const,
+      version: "16" as const,
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Postgres.Provider;
+        return yield* provider.reconcile(
+          reconcileInput(props, {
+            id: "dpg-1",
+            datastoreId: "dpg-1",
+            name: "db",
+            datadogApiKeyDigest: "previous-digest",
+            datadogSite: "US1",
+          }),
+        );
+      }).pipe(
+        Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    expect(patchBody).toMatchObject({ datadogAPIKey: "", datadogSite: "" });
+    expect(result.datadogApiKeyDigest).toBeUndefined();
+    expect(result.datadogSite).toBeUndefined();
+  });
+
+  it("rejects an explicit autoscaled Postgres shrink but tolerates autoscaling growth", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      methods.push(new Request(input, init).method);
+      return json({
+        id: "dpg-1",
+        name: "db",
+        plan: "basic_1gb",
+        version: "16",
+        diskSizeGB: 15,
+        diskAutoscalingEnabled: true,
+        highAvailabilityEnabled: false,
+        connectionPool: "none",
+        ipAllowList: [],
+        parameterOverrides: {},
+        readReplicas: [],
+        status: "available",
+      });
+    }) as typeof globalThis.fetch;
+    const previous = {
+      name: "db",
+      plan: "basic_1gb" as const,
+      version: "16" as const,
+      diskSizeGB: 10,
+      enableDiskAutoscaling: true,
+    };
+    const output = {
+      id: "dpg-1",
+      datastoreId: "dpg-1",
+      name: "db",
+      diskSizeGB: 10,
+    };
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Postgres.Provider;
+          return yield* provider.diff!(
+            diffInput(previous, { ...previous, diskSizeGB: 5 }, output),
+          );
+        }).pipe(
+          Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Postgres storage can only grow");
+    expect(methods).toEqual([]);
+
+    const unchanged = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Postgres.Provider;
+        return yield* provider.diff!(diffInput(previous, previous, output));
+      }).pipe(
+        Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+    expect(unchanged).toBeUndefined();
+    expect(methods).toEqual(["GET"]);
+  });
+
+  it("rejects Postgres storage shrinkage before PATCH", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      return json({
+        id: "dpg-1",
+        name: "db",
+        plan: "basic_1gb",
+        version: "16",
+        diskSizeGB: 10,
+        status: "available",
+      });
+    }) as typeof globalThis.fetch;
+    const props = {
+      name: "db",
+      plan: "basic_1gb" as const,
+      version: "16" as const,
+      diskSizeGB: 5,
+    };
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Postgres.Provider;
+          return yield* provider.reconcile(
+            reconcileInput(props, {
+              id: "dpg-1",
+              datastoreId: "dpg-1",
+              name: "db",
+              diskSizeGB: 10,
+            }),
+          );
+        }).pipe(
+          Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Postgres storage can only grow");
+    expect(methods).toEqual(["GET"]);
+  });
+
+  it("recovers an accepted environment write and still deploys it", async () => {
+    const requests: string[] = [];
+    let reads = 0;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (request.method === "GET") {
+        reads += 1;
+        return reads === 1
+          ? json({ message: "missing" }, 404)
+          : json({ key: "TOKEN" });
+      }
+      if (request.method === "PUT") {
+        return json({ message: "indeterminate write" }, 500);
+      }
+      return json({ id: "dep-recovered", status: "created" }, 201);
+    }) as typeof globalThis.fetch;
+    const props = {
+      serviceId: "srv-1",
+      key: "TOKEN",
+      value: Redacted.make("secret"),
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceEnvVar.Provider;
+        return yield* provider.reconcile(reconcileInput(props));
+      }).pipe(
+        Effect.provide(
+          ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(result.valueDigest).toHaveLength(64);
+    expect(requests).toEqual([
+      "GET /v1/services/srv-1/env-vars/TOKEN",
+      "PUT /v1/services/srv-1/env-vars/TOKEN",
+      "GET /v1/services/srv-1/env-vars/TOKEN",
+      "POST /v1/services/srv-1/deploys",
+    ]);
+  });
+
+  it("deploys after standalone service environment writes and deletes", async () => {
+    const requests: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (request.method === "GET") return json({ message: "not found" }, 404);
+      if (path.endsWith("/deploys")) return new Response(null, { status: 202 });
+      if (request.method === "DELETE") return new Response(null, { status: 204 });
+      return json({ key: "TOKEN" });
+    }) as typeof globalThis.fetch;
+    const props = {
+      serviceId: "srv-1",
+      key: "TOKEN",
+      value: Redacted.make("secret"),
+    };
+    const output = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceEnvVar.Provider;
+        return yield* provider.reconcile(reconcileInput(props));
+      }).pipe(
+        Effect.provide(
+          ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+    await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceEnvVar.Provider;
+        yield* provider.delete(deleteInput(props, output));
+      }).pipe(
+        Effect.provide(
+          ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+    expect(requests).toEqual([
+      "GET /v1/services/srv-1/env-vars/TOKEN",
+      "PUT /v1/services/srv-1/env-vars/TOKEN",
+      "POST /v1/services/srv-1/deploys",
+      "DELETE /v1/services/srv-1/env-vars/TOKEN",
+      "POST /v1/services/srv-1/deploys",
+    ]);
+  });
+
+  it("does not turn a rejected create into an unrelated PATCH", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "GET") return json([]);
+      return json({ message: "invalid" }, 400);
+    }) as typeof globalThis.fetch;
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Project.Provider;
+          return yield* provider.reconcile(reconcileInput({ name: "app" }));
+        }).pipe(
+          Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Render API returned 400");
+    expect(methods).toEqual(["GET", "POST"]);
+  });
+
+  it("recovers an indeterminate create without PATCHing the observed object", async () => {
+    const methods: string[] = [];
+    let created = false;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "POST") {
+        created = true;
+        throw new Error("connection closed after accept");
+      }
+      return created
+        ? json([{ project: { id: "prj-1", name: "app" } }])
+        : json([]);
+    }) as typeof globalThis.fetch;
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Project.Provider;
+        return yield* provider.reconcile(reconcileInput({ name: "app" }));
+      }).pipe(
+        Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+    expect(result.projectId).toBe("prj-1");
+    expect(methods).toEqual(["GET", "POST", "GET"]);
+  });
+
+  it("rejects ambiguous cold lookups instead of adopting the first match", async () => {
+    const fetch = (async () =>
+      json([
+        { project: { id: "prj-1", name: "app" } },
+        { project: { id: "prj-2", name: "app" } },
+      ])) as typeof globalThis.fetch;
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Project.Provider;
+          return yield* provider.reconcile(reconcileInput({ name: "app" }));
+        }).pipe(
+          Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Render lookup matched multiple resources");
   });
 });
