@@ -85,6 +85,7 @@ describe("declarative service-owned configuration", () => {
   it("creates with env and numInstances without persisting plaintext or polling", async () => {
     const methods: string[] = [];
     const bodies: unknown[] = [];
+    let deleted = false;
     const remoteEnv: Record<string, string> = {
       TOKEN: "first",
       MODE: "production",
@@ -109,7 +110,9 @@ describe("declarative service-owned configuration", () => {
           })),
         );
       }
-      if (request.method === "GET") return json(service());
+      if (request.method === "GET") {
+        return deleted ? json({ message: "not found" }, 404) : json(service());
+      }
       return json({ message: "unexpected write" }, 500);
     }) as typeof globalThis.fetch;
 
@@ -127,7 +130,24 @@ describe("declarative service-owned configuration", () => {
         const unchanged = yield* provider.reconcile(
           reconcileInput(props, created),
         );
-        return { created, unchanged };
+        const beforeDeletionDiff = methods.length;
+        deleted = true;
+        const deletionDiff = yield* provider.diff!({
+          id: "Api",
+          fqn: "Api",
+          instanceId: "00112233445566778899aabbccddeeff",
+          olds: props,
+          news: props,
+          output: unchanged,
+          oldBindings: [],
+          newBindings: [],
+        });
+        return {
+          created,
+          unchanged,
+          deletionDiff,
+          deletionRequests: methods.slice(beforeDeletionDiff),
+        };
       }).pipe(
         Effect.provide(
           WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
@@ -149,6 +169,8 @@ describe("declarative service-owned configuration", () => {
     expect(JSON.stringify(props)).not.toContain("first");
     expect(methods.filter((entry) => entry.includes("/deploys/"))).toEqual([]);
     expect(methods.filter((entry) => entry.startsWith("PUT "))).toEqual([]);
+    expect(result.deletionDiff).toEqual({ action: "update" });
+    expect(result.deletionRequests).toEqual(["GET /v1/services/srv-1"]);
   });
 
   it("rotates and deletes env with one deployment transition each", async () => {
@@ -268,10 +290,32 @@ describe("declarative service-owned configuration", () => {
         );
         observedInstances = 1;
         requests.length = 0;
+        const refreshed = yield* provider.read!({
+          id: "Api",
+          fqn: "Api",
+          instanceId: "00112233445566778899aabbccddeeff",
+          olds: props,
+          output: created,
+        });
+        const driftDiff = yield* provider.diff!({
+          id: "Api",
+          fqn: "Api",
+          instanceId: "00112233445566778899aabbccddeeff",
+          olds: props,
+          news: props,
+          output: refreshed,
+          oldBindings: [],
+          newBindings: [],
+        });
         const corrected = yield* provider.reconcile(
           reconcileInput(props, created),
         );
-        return { createRequest, corrected, correctionRequests: [...requests] };
+        return {
+          createRequest,
+          driftDiff,
+          corrected,
+          correctionRequests: [...requests],
+        };
       }).pipe(
         Effect.provide(
           WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
@@ -282,6 +326,7 @@ describe("declarative service-owned configuration", () => {
     expect(result.createRequest?.body).toMatchObject({
       serviceDetails: { numInstances: 2 },
     });
+    expect(result.driftDiff).toEqual({ action: "update" });
     expect(
       result.correctionRequests.filter(({ method }) => method !== "GET"),
     ).toEqual([

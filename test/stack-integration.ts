@@ -22,6 +22,16 @@ export const compileTimeRenderStack = Alchemy.Stack(
       env: { TOKEN: Redacted.make("secret") },
     });
 
+    yield* Render.BackgroundWorker("Worker", {
+      name: "worker",
+      runtime: "image",
+      image: { imagePath: "docker.io/acme/worker:1" },
+      region: "frankfurt",
+      plan: "standard",
+      numInstances: 1,
+      env: { QUEUE: Redacted.make("default") },
+    });
+
     const webService = yield* Render.WebService("Web", {
       name: "web",
       runtime: "image",

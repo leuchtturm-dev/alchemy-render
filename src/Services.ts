@@ -746,22 +746,26 @@ const provider = <R extends ManagedService>(
       updateBody(kind, props, name, ownerId),
     observe: (entity: Record<string, unknown>) => observe(entity, kind),
     attributes: makeAttributes,
-    reconcileOnNoop: scalable.has(kind),
+    reconcileOnNoop: true,
     sensitiveChanged: (_olds, news, output) => {
-      if (!scalable.has(kind)) return false;
-      const desired = news as ServiceCoreProps;
-      const desiredEnvDigest =
-        desired.env === undefined ? undefined : environmentDigest(desired.env);
       const desiredCoreDigest = coreDigest(
         kind,
         news,
         news.name ?? output.name ?? output.serviceId,
         output.ownerId ?? "",
       );
+      if (
+        output.coreDigest !== undefined &&
+        desiredCoreDigest !== output.coreDigest
+      ) {
+        return true;
+      }
+      if (!scalable.has(kind)) return false;
+      const desired = news as ServiceCoreProps;
+      const desiredEnvDigest =
+        desired.env === undefined ? undefined : environmentDigest(desired.env);
       return (
         desiredEnvDigest !== output.envDigest ||
-        (output.coreDigest !== undefined &&
-          desiredCoreDigest !== output.coreDigest) ||
         (desired.numInstances !== undefined &&
           desired.numInstances !== output.numInstances)
       );

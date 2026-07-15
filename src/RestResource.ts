@@ -555,6 +555,9 @@ export const restProvider = <
             return { action: "update" as const };
           }
           const api = yield* getApi;
+          const identity = output.id;
+          const liveEntity = yield* getEntity(api, identity, resolvedNews);
+          if (!liveEntity) return { action: "update" as const };
           if (
             descriptor.remoteSensitiveChanged &&
             (yield* descriptor.remoteSensitiveChanged(
@@ -565,9 +568,6 @@ export const restProvider = <
           ) {
             return { action: "update" as const };
           }
-          const identity = output.id;
-          const liveEntity = yield* getEntity(api, identity, resolvedNews);
-          if (!liveEntity) return { action: "update" as const };
           if (descriptor.remoteDiff === false) return undefined;
           const bodyIdentity =
             desiredIdentity(resolvedNews as Record<string, unknown>) ??
