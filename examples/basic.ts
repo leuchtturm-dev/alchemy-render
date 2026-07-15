@@ -12,11 +12,11 @@ export const basic = Effect.gen(function* () {
     plan: "starter",
     buildCommand: "bun install",
     startCommand: "bun run start",
+    numInstances: 2,
+    env: {
+      API_TOKEN: Redacted.make("replace-me"),
+    },
   });
 
-  yield* Render.ServiceEnvVar("api-token", {
-    serviceId: service.serviceId,
-    key: "API_TOKEN",
-    value: Redacted.make("replace-me"),
-  });
+  return { url: service.url };
 });

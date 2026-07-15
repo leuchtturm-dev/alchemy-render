@@ -1,7 +1,7 @@
 import * as Action from "alchemy/Action";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { RenderApi } from "./Api/Api.js";
+import { apiFromProviders, Providers } from "./Providers.js";
 
 /** Render actions have at-least-once execution semantics. */
 
@@ -144,10 +144,10 @@ const operation = <const Type extends string, Props extends object>(
   path: (props: Props) => string,
   body?: (props: Props) => unknown,
 ) =>
-  Action.Action<Type, Props, AcceptedResult, RenderApi>(
+  Action.Action<Type, Props, AcceptedResult, Providers>(
     type,
     Effect.gen(function* () {
-      const getApi = yield* RenderApi;
+      const getApi = yield* apiFromProviders;
       return (props) =>
         Effect.gen(function* () {
           const api = yield* getApi;

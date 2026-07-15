@@ -4,8 +4,9 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import { RecoverPostgres, RunTask } from "../src/Actions.js";
-import { layer as apiLayer } from "../src/Api/Api.js";
+import { RenderApi, layer as apiLayer } from "../src/Api/Api.js";
 import { fromApiKey } from "../src/Credentials.js";
+import { Providers } from "../src/Providers.js";
 
 const runPromise = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.runPromise(effect as Effect.Effect<A, E>);
@@ -26,6 +27,20 @@ const withApi = (fetch: typeof globalThis.fetch) =>
       }),
     ),
   );
+
+const withProviders = (fetch: typeof globalThis.fetch) =>
+  Layer.effect(
+    Providers,
+    Effect.gen(function* () {
+      const renderApi = yield* RenderApi;
+      return {
+        kind: "ProviderCollection" as const,
+        get: () => undefined,
+        providers: {},
+        renderApi,
+      };
+    }),
+  ).pipe(Layer.provide(withApi(fetch)));
 
 describe("at-least-once Actions", () => {
   it("uses the documented Postgres recovery path and secret field casing", async () => {
@@ -58,7 +73,7 @@ describe("at-least-once Actions", () => {
         return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
-        Effect.provide(withApi(fetch)),
+        Effect.provide(withProviders(fetch)),
       ),
     );
 
@@ -106,7 +121,7 @@ describe("at-least-once Actions", () => {
         return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
-        Effect.provide(withApi(fetch)),
+        Effect.provide(withProviders(fetch)),
       ),
     );
     expect(body).toEqual({

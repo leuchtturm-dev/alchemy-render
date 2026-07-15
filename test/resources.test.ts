@@ -1094,7 +1094,7 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     );
-    expect(methods).toEqual(["GET", "POST", "PATCH"]);
+    expect(methods).toEqual(["GET", "POST", "PATCH", "POST"]);
     expect(bodies[1]).toEqual({
       serviceDetails: { cache: { profile: "origin-controlled" } },
     });

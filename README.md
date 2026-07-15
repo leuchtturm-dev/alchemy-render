@@ -31,13 +31,16 @@ export default Alchemy.Stack(
       startCommand: "bun run start",
       plan: "starter",
       region: "oregon",
-      waitForDeploy: true,
+      numInstances: 2,
+      env: {
+        API_TOKEN: Redacted.make("replace-me"),
+        NODE_ENV: Redacted.make("production"),
+      },
     });
 
-    yield* Render.ServiceEnvVar("ApiToken", {
+    yield* Render.CustomDomain("ApiDomain", {
       serviceId: api.serviceId,
-      key: "API_TOKEN",
-      value: Redacted.make("replace-me"),
+      name: "api.example.com",
     });
 
     return { url: api.url };
@@ -74,16 +77,16 @@ For tests or embedding, `Render.fromApiKey({ apiKey, ownerId, apiBaseUrl? })` pr
 
 ## Ownership and adoption
 
-Service Resources own only the core service object. Independently addressable configuration is deliberately managed by standalone Resources:
+`WebService`, `PrivateService`, and `BackgroundWorker` can own two aggregate configuration surfaces directly:
 
-- environment variables and secret files
-- custom domains and disks
-- static-site headers and routes
-- autoscaling
-- environment and environment-group links
-- log and notification overrides
+- `env` is the complete service-owned environment. It accepts a readonly record of `Redacted<string>` values. An explicit empty object removes all environment variables; omitting `env` leaves environment variables unmanaged.
+- `numInstances` is the fixed/manual instance count. Omit it when another system manages scaling.
 
-Do not let two stacks—or a Resource and another tool—authoritatively manage the same child object. This avoids destructive replace-all conflicts present in aggregate configuration models. Header and route field changes replace the rule because headers have no item-update endpoint and route PATCH only changes priority. Workflow environment variables are create-only in the API, so adding, removing, or rotating one replaces the Workflow.
+Other independently addressable configuration remains available through standalone Resources: secret files, custom domains, disks, static-site headers and routes, autoscaling, environment links, log streams, and notification overrides.
+
+Do not mix service-owned `env` with `ServiceEnvVar` for the same service: aggregate reconciliation uses Render's replace-all endpoint and can delete independently managed keys. Likewise, do not combine service-owned `numInstances` with `Autoscaling` or an independently invoked `ScaleService` Action. Low-level Resources and Actions remain available when the high-level property is omitted.
+
+Do not let two stacks—or a Resource and another tool—authoritatively manage the same child object. Header and route field changes replace the rule because headers have no item-update endpoint and route PATCH only changes priority. Workflow environment variables are create-only in the API, so adding, removing, or rotating one replaces the Workflow.
 
 On a cold read, name-addressable Render objects are returned as `Unowned`. Deploy with Alchemy's `--adopt` flow only after confirming the matching object is safe to take over. Reads by a previously persisted physical ID remain owned. Resources that cannot be enumerated without a parent are explicitly excluded from `alchemy unsafe nuke`; ordinary stack deletion still removes them.
 
@@ -93,17 +96,23 @@ Secret inputs use `Redacted<string>`. Write-only values such as registry tokens,
 
 A digest is not encryption, and resource state still contains infrastructure metadata. Protect state and credential files accordingly. API errors retain only numeric status and a server request ID; response bodies and status text are discarded because they can echo secret input.
 
-## Service deploy behavior
+## Declarative reconciliation and deploy behavior
 
-Creating a Render service already initiates a deploy. Set `waitForDeploy: true` to poll the concrete deploy ID until it reaches `live`; `deployTimeoutMs` defaults to three hours. Core service reconciliation sends a PATCH only when the observed core configuration differs.
+Render's create-service contract accepts `envVars`, so initial creation includes the declared environment and fixed instance count in the create request. Creation's returned deploy is exposed as `deployId` when Render supplies it.
 
-The provider does **not** trigger an additional deploy after updates. Use the explicit `Deploy` Action when you need a manual deploy, commit-specific deploy, or cache-clearing deploy. Because Render's create contract does not accept web-cache settings, a requested `cache` profile is applied with one immediate PATCH after creation.
+On updates, the service provider owns the complete transition: it reconciles the core service, replaces the declared environment (including deletions), corrects fixed/manual scaling through the scale endpoint, and starts one deployment when core or environment configuration changed. Unchanged services issue no PATCH, scale request, or deploy. Secret rotation is detected with SHA-256 equality digests; plaintext values are never stored in Attributes.
+
+Reconciliation does not poll by default. Set `waitForDeploy: true` to poll only the concrete deployment created by that reconciliation until it reaches `live`; `deployTimeoutMs` defaults to three hours. Consumer stacks never need deployment polling.
+
+Use the explicit `Deploy` Action only for genuinely imperative operations: deploying a specific commit or image, forcing a rebuild, or clearing build cache. Ordinary service and environment changes do not need an Action. Because Render's create contract does not accept web-cache settings, a requested `cache` profile is applied immediately after creation and the provider deploys the resulting configuration.
 
 ## Actions are at-least-once
 
 Alchemy Actions have no Resource-style read recovery. If a process stops after Render accepts an Action but before Alchemy persists its result, a later apply can run it again. Deploys, jobs, previews, restores, recoveries, credential rotations, exports, workflow versions, and task runs can therefore be duplicated.
 
 The transport never retries unsafe POST/PATCH requests after network or 5xx failures, but process-level replay remains possible. Use stable logical IDs, inspect Render before forcing an Action, and treat every Action as replayable.
+
+Declarative service deployment has stronger recovery than an Action: persisted core/environment digests and remote reads let a later apply finish a transition interrupted before deploy creation. Render does not document an idempotency key for `POST /deploys`, so one residual case cannot be made exactly-once: if Render accepts the deploy but the process stops before Alchemy persists the new digest/deploy ID, recovery conservatively creates another deploy. This favors completing the declared transition over silently leaving configuration undeployed.
 
 ## Capability matrix
 

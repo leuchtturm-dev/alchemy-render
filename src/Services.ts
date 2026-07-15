@@ -1,8 +1,19 @@
+import { createHash } from "node:crypto";
 import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
-import { poll, RenderApiError } from "./Api/Api.js";
+import * as Redacted from "effect/Redacted";
+import {
+  poll,
+  RenderApiError,
+  type RenderApiClient,
+} from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
-import { restProvider, type CommonAttributes } from "./RestResource.js";
+import {
+  restProvider,
+  unwrapEntity,
+  unwrapRows,
+  type CommonAttributes,
+} from "./RestResource.js";
 
 export type Region = "frankfurt" | "oregon" | "ohio" | "singapore" | "virginia";
 export type ServiceRuntime =
@@ -100,6 +111,10 @@ export interface ServiceSourceProps {
   readonly registryCredentialId?: string;
 }
 
+export type ServiceEnvironment = Readonly<
+  Record<string, Redacted.Redacted<string>>
+>;
+
 export interface ServiceCoreProps {
   /** Physical name. Alchemy generates one when omitted. */
   readonly name?: string;
@@ -110,7 +125,14 @@ export interface ServiceCoreProps {
   readonly preDeployCommand?: string;
   readonly previews?: { readonly generation?: "off" | "manual" | "automatic" };
   readonly maxShutdownDelaySeconds?: number;
-  /** Wait for the deploy returned by service creation to reach `live`. */
+  /**
+   * Complete environment owned by this service. Omit to leave environment
+   * variables unmanaged; use an empty object to remove all managed variables.
+   */
+  readonly env?: ServiceEnvironment;
+  /** Fixed/manual instance count. Do not combine with Autoscaling. */
+  readonly numInstances?: number;
+  /** Wait for the deployment created by reconciliation to reach `live`. */
   readonly waitForDeploy?: boolean;
   /** @default 10800000 (3 hours) */
   readonly deployTimeoutMs?: number;
@@ -191,6 +213,12 @@ export interface ServiceAttributes extends CommonAttributes {
   readonly region?: Region;
   readonly environmentId?: string;
   readonly deployId?: string;
+  /** Equality-only digest of the service-owned environment. */
+  readonly envDigest?: string;
+  /** Equality-only marker for the core configuration's deployed transition. */
+  readonly coreDigest?: string;
+  /** Observed fixed/manual instance count. */
+  readonly numInstances?: number;
 }
 
 type ServiceResource<
@@ -205,7 +233,7 @@ type ServiceResource<
   Providers
 >;
 
-/** A Render public web service. Child configuration is managed separately. @resource */
+/** A Render public web service. @resource */
 export type WebService = ServiceResource<
   "Render.WebService",
   WebServiceProps,
@@ -297,6 +325,72 @@ const sourceBody = (props: ServiceSourceProps, ownerId: string) => {
   };
 };
 
+const scalable = new Set<ServiceAttributes["type"]>([
+  "web_service",
+  "private_service",
+  "background_worker",
+]);
+
+const validateNumInstances = (value: number | undefined) => {
+  if (value !== undefined && (!Number.isInteger(value) || value < 1)) {
+    throw new Error("Render numInstances must be a positive integer");
+  }
+};
+
+const environmentEntries = (env: ServiceEnvironment) =>
+  Object.entries(env)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, value]) => {
+      if (!Redacted.isRedacted(value)) {
+        throw new Error(`Render environment value for ${key} must be Redacted`);
+      }
+      return [key, Redacted.value(value)] as const;
+    });
+
+const environmentDigestFromEntries = (
+  entries: readonly (readonly [string, string])[],
+) => {
+  const hash = createHash("sha256");
+  for (const [key, value] of entries) {
+    hash.update(String(Buffer.byteLength(key))).update(":").update(key);
+    hash.update(String(Buffer.byteLength(value))).update(":").update(value);
+  }
+  return hash.digest("hex");
+};
+
+const environmentDigest = (env: ServiceEnvironment) =>
+  environmentDigestFromEntries(environmentEntries(env));
+
+const environmentBody = (env: ServiceEnvironment) =>
+  environmentEntries(env).map(([key, value]) => ({ key, value }));
+
+const readEnvironmentDigest = (
+  api: RenderApiClient,
+  serviceId: string,
+): Effect.Effect<string, RenderApiError> =>
+  Effect.gen(function* () {
+    const entries: Array<readonly [string, string]> = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const response = yield* api.request({
+        method: "GET",
+        path: `/services/${encodeURIComponent(serviceId)}/env-vars`,
+        query: { limit: 100, ...(cursor ? { cursor } : {}) },
+      });
+      const rows = unwrapRows(response);
+      for (const { entity } of rows) {
+        if (typeof entity.key === "string" && typeof entity.value === "string") {
+          entries.push([entity.key, entity.value]);
+        }
+      }
+      const next = rows.at(-1)?.cursor;
+      if (!next || next === cursor || rows.length === 0) break;
+      cursor = next;
+    }
+    entries.sort(([left], [right]) => left.localeCompare(right));
+    return environmentDigestFromEntries(entries);
+  });
+
 const createDetails = (
   kind: ServiceAttributes["type"],
   props:
@@ -317,6 +411,8 @@ const createDetails = (
     };
   }
   const service = props as Exclude<typeof props, StaticSiteProps>;
+  const serviceCore = service as ServiceCoreProps;
+  validateNumInstances(serviceCore.numInstances);
   return {
     runtime: service.runtime,
     envSpecificDetails: envSpecificDetails(service),
@@ -332,8 +428,10 @@ const createDetails = (
       kind === "cron_job"
         ? undefined
         : (service as ServiceCoreProps).maxShutdownDelaySeconds,
-    ...(kind === "private_service" || kind === "background_worker"
-      ? { numInstances: 1 }
+    ...(scalable.has(kind)
+      ? kind === "web_service" && serviceCore.numInstances === undefined
+        ? {}
+        : { numInstances: serviceCore.numInstances ?? 1 }
       : {}),
     ...(kind === "web_service"
       ? {
@@ -414,6 +512,9 @@ const createBody = (
   autoDeploy: props.autoDeploy,
   rootDir: props.rootDir,
   buildFilter: props.buildFilter,
+  ...(scalable.has(kind) && (props as ServiceCoreProps).env !== undefined
+    ? { envVars: environmentBody((props as ServiceCoreProps).env!) }
+    : {}),
   ...(kind === "static_site"
     ? { repo: props.repo, branch: props.branch }
     : sourceBody(props as ServiceSourceProps, ownerId)),
@@ -435,6 +536,16 @@ const updateBody = (
     : sourceBody(props as ServiceSourceProps, ownerId)),
   serviceDetails: updateDetails(kind, props),
 });
+
+const coreDigest = (
+  kind: ServiceAttributes["type"],
+  props: ManagedServiceProps,
+  name: string,
+  ownerId: string,
+) =>
+  createHash("sha256")
+    .update(JSON.stringify(updateBody(kind, props, name, ownerId)))
+    .digest("hex");
 
 const record = (value: unknown): Record<string, unknown> =>
   typeof value === "object" && value !== null
@@ -541,6 +652,17 @@ const attributes =
         : fallback.previous?.deployId
           ? { deployId: fallback.previous.deployId }
           : {}),
+      ...(typeof details.numInstances === "number"
+        ? { numInstances: details.numInstances }
+        : fallback.previous?.numInstances !== undefined
+          ? { numInstances: fallback.previous.numInstances }
+          : {}),
+      ...(fallback.previous?.envDigest
+        ? { envDigest: fallback.previous.envDigest }
+        : {}),
+      ...(fallback.previous?.coreDigest
+        ? { coreDigest: fallback.previous.coreDigest }
+        : {}),
       ...(typeof entity.createdAt === "string"
         ? { createdAt: entity.createdAt }
         : {}),
@@ -549,6 +671,56 @@ const attributes =
         : {}),
     };
   };
+
+const waitForDeployment = (
+  api: RenderApiClient,
+  serviceId: string,
+  deployId: string,
+  timeoutMs: number,
+) =>
+  Effect.gen(function* () {
+    const terminal = new Set([
+      "live",
+      "deactivated",
+      "build_failed",
+      "update_failed",
+      "canceled",
+      "pre_deploy_failed",
+    ]);
+    const deploy = yield* poll(
+      api
+        .request({
+          method: "GET",
+          path: `/services/${encodeURIComponent(serviceId)}/deploys/${encodeURIComponent(deployId)}`,
+        })
+        .pipe(Effect.map((value) => record(value))),
+      {
+        timeoutMs,
+        while: (value) => !terminal.has(String(value.status ?? "")),
+      },
+    );
+    if (deploy.status !== "live") {
+      return yield* Effect.fail(
+        new RenderApiError(
+          `Render deploy ${deployId} ended in ${String(deploy.status)}`,
+        ),
+      );
+    }
+  });
+
+const createDeployment = (api: RenderApiClient, serviceId: string) =>
+  api
+    .request({
+      method: "POST",
+      path: `/services/${encodeURIComponent(serviceId)}/deploys`,
+      body: {},
+    })
+    .pipe(
+      Effect.map((value) => {
+        const deploy = unwrapEntity(value);
+        return typeof deploy.id === "string" ? deploy.id : undefined;
+      }),
+    );
 
 const provider = <R extends ManagedService>(
   resource: Resource.ResourceClass<R>,
@@ -574,9 +746,56 @@ const provider = <R extends ManagedService>(
       updateBody(kind, props, name, ownerId),
     observe: (entity: Record<string, unknown>) => observe(entity, kind),
     attributes: makeAttributes,
+    reconcileOnNoop: scalable.has(kind),
+    sensitiveChanged: (_olds, news, output) => {
+      if (!scalable.has(kind)) return false;
+      const desired = news as ServiceCoreProps;
+      const desiredEnvDigest =
+        desired.env === undefined ? undefined : environmentDigest(desired.env);
+      const desiredCoreDigest = coreDigest(
+        kind,
+        news,
+        news.name ?? output.name ?? output.serviceId,
+        output.ownerId ?? "",
+      );
+      return (
+        desiredEnvDigest !== output.envDigest ||
+        (output.coreDigest !== undefined &&
+          desiredCoreDigest !== output.coreDigest) ||
+        (desired.numInstances !== undefined &&
+          desired.numInstances !== output.numInstances)
+      );
+    },
+    remoteSensitiveChanged: (news, output, api) => {
+      if (!scalable.has(kind)) return Effect.succeed(false);
+      const desired = news as ServiceCoreProps;
+      if (desired.env === undefined) return Effect.succeed(false);
+      const digest = environmentDigest(desired.env);
+      if (digest !== output.envDigest) return Effect.succeed(true);
+      return readEnvironmentDigest(api, output.serviceId).pipe(
+        Effect.map((observed) => observed !== digest),
+      );
+    },
     finalize: (service, props, api, phase) =>
       Effect.gen(function* () {
         let current = service;
+        const desiredCoreDigest = coreDigest(
+          kind,
+          props,
+          props.name ?? current.name ?? current.serviceId,
+          current.ownerId ?? api.ownerId,
+        );
+        let needsDeployment =
+          phase === "update" ||
+          (phase === "reconcile" &&
+            current.coreDigest !== undefined &&
+            current.coreDigest !== desiredCoreDigest);
+        let deploymentToWaitFor =
+          phase === "create" ? current.deployId : undefined;
+        if (phase === "create" || current.coreDigest === undefined) {
+          current = { ...current, coreDigest: desiredCoreDigest };
+        }
+
         if (
           phase === "create" &&
           kind === "web_service" &&
@@ -589,40 +808,87 @@ const provider = <R extends ManagedService>(
               serviceDetails: { cache: (props as WebServiceProps).cache },
             },
           });
-          current = makeAttributes(record(patched), {
-            id: service.serviceId,
-            ownerId: service.ownerId ?? api.ownerId,
-            previous: service,
-          });
+          current = {
+            ...current,
+            ...makeAttributes(record(patched), {
+              id: service.serviceId,
+              ownerId: service.ownerId ?? api.ownerId,
+              previous: service,
+            }),
+          };
+          needsDeployment = true;
         }
-        if (phase !== "create" || !props.waitForDeploy || !current.deployId) {
-          return current;
+
+        if (scalable.has(kind)) {
+          const desired = props as ServiceCoreProps;
+          validateNumInstances(desired.numInstances);
+          if (desired.env !== undefined) {
+            const desiredDigest = environmentDigest(desired.env);
+            if (phase === "create") {
+              current = { ...current, envDigest: desiredDigest };
+            } else if (phase === "read") {
+              if (current.envDigest === undefined) {
+                current = {
+                  ...current,
+                  envDigest: yield* readEnvironmentDigest(
+                    api,
+                    current.serviceId,
+                  ),
+                };
+              }
+            } else {
+              const observedDigest = yield* readEnvironmentDigest(
+                api,
+                current.serviceId,
+              );
+              const transitionWasUnpersisted =
+                current.envDigest !== desiredDigest;
+              if (observedDigest !== desiredDigest) {
+                yield* api.request({
+                  method: "PUT",
+                  path: `/services/${encodeURIComponent(current.serviceId)}/env-vars`,
+                  body: environmentBody(desired.env),
+                });
+                needsDeployment = true;
+              }
+              if (transitionWasUnpersisted) needsDeployment = true;
+              current = { ...current, envDigest: desiredDigest };
+            }
+          } else if (phase !== "read" && current.envDigest !== undefined) {
+            const { envDigest: _released, ...released } = current;
+            current = released as R["Attributes"];
+          }
+
+          if (
+            phase !== "create" &&
+            phase !== "read" &&
+            desired.numInstances !== undefined &&
+            current.numInstances !== desired.numInstances
+          ) {
+            yield* api.request({
+              method: "POST",
+              path: `/services/${encodeURIComponent(current.serviceId)}/scale`,
+              body: { numInstances: desired.numInstances },
+            });
+            current = { ...current, numInstances: desired.numInstances };
+          }
         }
-        const terminal = new Set([
-          "live",
-          "deactivated",
-          "build_failed",
-          "update_failed",
-          "canceled",
-          "pre_deploy_failed",
-        ]);
-        const deploy = yield* poll(
-          api
-            .request({
-              method: "GET",
-              path: `/services/${encodeURIComponent(current.serviceId)}/deploys/${encodeURIComponent(current.deployId)}`,
-            })
-            .pipe(Effect.map((value) => value as Record<string, unknown>)),
-          {
-            timeoutMs: props.deployTimeoutMs ?? 3 * 60 * 60 * 1_000,
-            while: (value) => !terminal.has(String(value.status ?? "")),
-          },
-        );
-        if (deploy.status !== "live") {
-          return yield* Effect.fail(
-            new RenderApiError(
-              `Render deploy ${current.deployId} ended in ${String(deploy.status)}`,
-            ),
+
+        if (phase !== "read" && needsDeployment) {
+          const deployId = yield* createDeployment(api, current.serviceId);
+          current = { ...current, coreDigest: desiredCoreDigest };
+          if (deployId !== undefined) {
+            current = { ...current, deployId };
+            deploymentToWaitFor = deployId;
+          }
+        }
+
+        if (props.waitForDeploy && deploymentToWaitFor) {
+          yield* waitForDeployment(
+            api,
+            current.serviceId,
+            deploymentToWaitFor,
+            props.deployTimeoutMs ?? 3 * 60 * 60 * 1_000,
           );
         }
         return current;

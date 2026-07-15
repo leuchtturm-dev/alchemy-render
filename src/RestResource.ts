@@ -57,6 +57,13 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     news: Props,
     output: Attrs,
   ) => boolean;
+  readonly remoteSensitiveChanged?: (
+    news: Props,
+    output: Attrs,
+    api: RenderApiClient,
+  ) => Effect.Effect<boolean, RenderApiError>;
+  /** Run finalize during reconcile even when the core object needs no write. */
+  readonly reconcileOnNoop?: boolean;
   readonly replaceWhen?: (olds: Props, news: Props, output: Attrs) => boolean;
   readonly lookupByList?: boolean;
   readonly identity?: "name" | "key" | "id";
@@ -97,7 +104,7 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     attrs: Attrs,
     props: Props,
     api: RenderApiClient,
-    phase: "read" | "create" | "update",
+    phase: "read" | "create" | "update" | "reconcile",
   ) => Effect.Effect<Attrs, RenderApiError>;
 }
 
@@ -249,7 +256,7 @@ export const restProvider = <
         attributes: R["Attributes"],
         props: R["Props"],
         api: RenderApiClient,
-        phase: "read" | "create" | "update",
+        phase: "read" | "create" | "update" | "reconcile",
       ) =>
         descriptor.finalize?.(attributes, props, api, phase) ??
         Effect.succeed(attributes);
@@ -548,6 +555,16 @@ export const restProvider = <
             return { action: "update" as const };
           }
           const api = yield* getApi;
+          if (
+            descriptor.remoteSensitiveChanged &&
+            (yield* descriptor.remoteSensitiveChanged(
+              resolvedNews,
+              output,
+              api,
+            ))
+          ) {
+            return { action: "update" as const };
+          }
           const identity = output.id;
           const liveEntity = yield* getEntity(api, identity, resolvedNews);
           if (!liveEntity) return { action: "update" as const };
@@ -634,7 +651,7 @@ export const restProvider = <
           if (
             liveEntity &&
             descriptor.remoteDiff !== false &&
-            !sensitiveNeedsWrite
+            (!sensitiveNeedsWrite || descriptor.reconcileOnNoop)
           ) {
             const observed = descriptor.observe
               ? descriptor.observe(liveEntity)
@@ -655,7 +672,9 @@ export const restProvider = <
                 }),
                 props,
                 api,
-                "read",
+                descriptor.reconcileOnNoop && output !== undefined
+                  ? "reconcile"
+                  : "read",
               );
             }
           }
