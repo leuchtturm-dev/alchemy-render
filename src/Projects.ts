@@ -3,9 +3,15 @@ import { isResolved } from "alchemy/Diff";
 import * as Provider from "alchemy/Provider";
 import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
-import { paginate, RenderApi, type RenderApiClient, type RenderApiError } from "./Api/Api.js";
+import {
+  paginate,
+  RenderApi,
+  type RenderApiClient,
+  type RenderApiError,
+} from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
+  resourceClass,
   restProvider,
   unwrapEntity,
   unwrapRows,
@@ -55,11 +61,18 @@ export interface EnvironmentResourceAttributes extends CommonAttributes {
   readonly resourceId: string;
 }
 
-type Managed<T extends string, P extends object, A extends object> =
-  Resource.Resource<T, P, A, never, Providers>;
+type Managed<
+  T extends string,
+  P extends object,
+  A extends object,
+> = Resource.Resource<T, P, A, never, Providers>;
 
 /** A Render project used to organize environments. @resource */
-export type Project = Managed<"Render.Project", ProjectProps, ProjectAttributes>;
+export type Project = Managed<
+  "Render.Project",
+  ProjectProps,
+  ProjectAttributes
+>;
 export const Project = Resource.Resource<Project>("Render.Project");
 
 /** A Render project environment. @resource */
@@ -76,8 +89,9 @@ export type EnvironmentResource = Managed<
   EnvironmentResourceProps,
   EnvironmentResourceAttributes
 >;
-export const EnvironmentResource =
-  Resource.Resource<EnvironmentResource>("Render.EnvironmentResource");
+export const EnvironmentResource = Resource.Resource<EnvironmentResource>(
+  "Render.EnvironmentResource",
+);
 
 export const ProjectProvider = () =>
   restProvider(Project, {
@@ -94,7 +108,9 @@ export const ProjectProvider = () =>
         projectId: id,
         ownerId: fallback.ownerId,
         environmentIds: Array.isArray(entity.environmentIds)
-          ? entity.environmentIds.filter((value): value is string => typeof value === "string")
+          ? entity.environmentIds.filter(
+              (value): value is string => typeof value === "string",
+            )
           : [],
         ...(typeof entity.name === "string" ? { name: entity.name } : {}),
       };
@@ -112,7 +128,7 @@ const environmentAttributes = (
     projectId:
       typeof entity.projectId === "string"
         ? entity.projectId
-        : fallback.props?.projectId ?? "",
+        : (fallback.props?.projectId ?? ""),
     protectedStatus:
       entity.protectedStatus === "protected" ? "protected" : "unprotected",
     networkIsolationEnabled: entity.networkIsolationEnabled === true,
@@ -124,15 +140,17 @@ const listEnvironments = (api: RenderApiClient) =>
   Effect.gen(function* () {
     const projects = yield* paginate(
       (cursor) =>
-        api.request({
-          method: "GET",
-          path: "/projects",
-          query: {
-            ownerId: api.ownerId,
-            limit: 100,
-            ...(cursor === undefined ? {} : { cursor }),
-          },
-        }).pipe(Effect.map(unwrapRows)),
+        api
+          .request({
+            method: "GET",
+            path: "/projects",
+            query: {
+              ownerId: api.ownerId,
+              limit: 100,
+              ...(cursor === undefined ? {} : { cursor }),
+            },
+          })
+          .pipe(Effect.map(unwrapRows)),
       { cursor: (row) => row.cursor },
     );
     const nested = yield* Effect.forEach(
@@ -143,22 +161,23 @@ const listEnvironments = (api: RenderApiClient) =>
         if (!projectId) return Effect.succeed([] as EnvironmentAttributes[]);
         return paginate(
           (cursor) =>
-            api.request({
-              method: "GET",
-              path: "/environments",
-              query: {
-                projectId,
-                limit: 100,
-                ...(cursor === undefined ? {} : { cursor }),
-              },
-            }).pipe(Effect.map(unwrapRows)),
+            api
+              .request({
+                method: "GET",
+                path: "/environments",
+                query: {
+                  projectId,
+                  limit: 100,
+                  ...(cursor === undefined ? {} : { cursor }),
+                },
+              })
+              .pipe(Effect.map(unwrapRows)),
           { cursor: (row) => row.cursor },
         ).pipe(
           Effect.map((rows) =>
             rows.map(({ entity }) =>
               environmentAttributes(entity, {
-                id:
-                  typeof entity.id === "string" ? entity.id : projectId,
+                id: typeof entity.id === "string" ? entity.id : projectId,
                 ownerId: api.ownerId,
                 props: { projectId },
               }),
@@ -204,13 +223,13 @@ const environmentContains = (
   entity: Record<string, unknown>,
   resourceId: string,
 ): boolean =>
-  ["serviceIds", "databasesIds", "redisIds", "envGroupIds"].some((key) =>
-    Array.isArray(entity[key]) && entity[key].includes(resourceId),
+  ["serviceIds", "databasesIds", "redisIds", "envGroupIds"].some(
+    (key) => Array.isArray(entity[key]) && entity[key].includes(resourceId),
   );
 
 export const EnvironmentResourceProvider = () =>
   Provider.effect(
-    EnvironmentResource as any,
+    resourceClass(EnvironmentResource),
     Effect.gen(function* () {
       const getApi = yield* RenderApi;
       const readMembership = (

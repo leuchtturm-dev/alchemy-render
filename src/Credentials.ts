@@ -37,7 +37,7 @@ export const fromApiKey = (input: ApiKeyCredentials) =>
     Credentials,
     Effect.succeed({
       apiKey: Redacted.isRedacted(input.apiKey)
-        ? (input.apiKey as Redacted.Redacted<string>)
+        ? input.apiKey
         : Redacted.make(input.apiKey),
       ownerId: input.ownerId,
       apiBaseUrl: input.apiBaseUrl ?? DEFAULT_API_BASE_URL,
@@ -57,9 +57,7 @@ export const fromAuthProvider = () =>
       const profileName = yield* ALCHEMY_PROFILE;
       const ci = yield* Config.boolean("CI").pipe(Config.withDefault(false));
       return yield* profile.loadOrConfigure(auth, profileName, { ci }).pipe(
-        Effect.flatMap((config) =>
-          auth.read(profileName, config as RenderAuthConfig),
-        ),
+        Effect.flatMap((config) => auth.read(profileName, config)),
         Effect.map(({ apiKey, ownerId, apiBaseUrl }) => ({
           apiKey,
           ownerId,

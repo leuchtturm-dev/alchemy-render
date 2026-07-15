@@ -7,25 +7,29 @@ import { Credentials } from "../Credentials.js";
 import { USER_AGENT } from "../Config.js";
 import type { paths } from "./schema.js";
 
+export interface RenderRequest {
+  readonly method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+  readonly path: string;
+  readonly query?: Readonly<
+    Record<
+      string,
+      | string
+      | number
+      | boolean
+      | readonly (string | number | boolean)[]
+      | undefined
+    >
+  >;
+  readonly body?: unknown;
+}
+
 export interface RenderApiClient {
   /** The authenticated, generated OpenAPI client. */
   readonly client: Client<paths>;
-  /** A small runtime escape hatch used by curated resources and actions. */
-  readonly request: <A = unknown>(input: {
-    readonly method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
-    readonly path: string;
-    readonly query?: Readonly<
-      Record<
-        string,
-        | string
-        | number
-        | boolean
-        | readonly (string | number | boolean)[]
-        | undefined
-      >
-    >;
-    readonly body?: unknown;
-  }) => Effect.Effect<A, RenderApiError>;
+  /** Authenticated transport used by resources and actions. */
+  readonly request: <A = unknown>(
+    input: RenderRequest,
+  ) => Effect.Effect<A, RenderApiError>;
   /** Default workspace/owner for owner-scoped resources. */
   readonly ownerId: string;
   /** Exact API root, including `/v1`. */
@@ -91,8 +95,12 @@ export const layer = (options: RenderApiLayerOptions = {}) =>
             Accept: "application/json",
             "User-Agent": USER_AGENT,
           };
-          const request: RenderApiClient["request"] = (input) => {
-            const url = new URL(`${baseUrl}${input.path.startsWith("/") ? input.path : `/${input.path}`}`);
+          const request = <A = unknown>(
+            input: RenderRequest,
+          ): Effect.Effect<A, RenderApiError> => {
+            const url = new URL(
+              `${baseUrl}${input.path.startsWith("/") ? input.path : `/${input.path}`}`,
+            );
             for (const [key, value] of Object.entries(input.query ?? {})) {
               if (Array.isArray(value)) {
                 for (const item of value) {
@@ -108,9 +116,13 @@ export const layer = (options: RenderApiLayerOptions = {}) =>
                   method: input.method,
                   headers: {
                     ...headers,
-                    ...(input.body === undefined ? {} : { "Content-Type": "application/json" }),
+                    ...(input.body === undefined
+                      ? {}
+                      : { "Content-Type": "application/json" }),
                   },
-                  ...(input.body === undefined ? {} : { body: JSON.stringify(input.body) }),
+                  ...(input.body === undefined
+                    ? {}
+                    : { body: JSON.stringify(input.body) }),
                 });
                 if (!response.ok) {
                   const requestId = safeRequestId(
@@ -122,11 +134,14 @@ export const layer = (options: RenderApiLayerOptions = {}) =>
                     ...(requestId === undefined ? {} : { requestId }),
                   });
                 }
-                const text = response.status === 204 ? "" : await response.text();
+                const text =
+                  response.status === 204 ? "" : await response.text();
                 try {
-                  return (text.length === 0 ? undefined : JSON.parse(text)) as never;
+                  return (
+                    text.length === 0 ? undefined : JSON.parse(text)
+                  ) as A;
                 } catch {
-                  return text as never;
+                  return text as A;
                 }
               },
               catch: (cause) =>
@@ -158,7 +173,6 @@ export const call = <A>(
     readonly error?: unknown;
     readonly response: Response;
   }>,
-  operation?: { readonly method?: string; readonly path?: string },
 ): Effect.Effect<A, RenderApiError> =>
   Effect.tryPromise({
     try: request,
@@ -167,7 +181,7 @@ export const call = <A>(
         ? cause
         : new RenderApiError("Render API request failed"),
   }).pipe(
-    Effect.flatMap(({ data, error, response }) => {
+    Effect.flatMap(({ data, response }) => {
       if (response.ok) return Effect.succeed(data as A);
       const requestId = safeRequestId(
         response.headers.get("x-render-request-id") ??
@@ -210,7 +224,9 @@ export interface PaginateOptions<Row> {
 
 /** Exhaust a Render cursor-paginated list without looping on a stale cursor. */
 export const paginate = <Row>(
-  page: (cursor: string | undefined) => Effect.Effect<readonly Row[], RenderApiError>,
+  page: (
+    cursor: string | undefined,
+  ) => Effect.Effect<readonly Row[], RenderApiError>,
   options: PaginateOptions<Row>,
 ): Effect.Effect<Row[], RenderApiError> =>
   Effect.gen(function* () {
@@ -250,7 +266,9 @@ export const poll = <A, E>(
       if (!options.while(value)) return value;
       if (Date.now() - started >= options.timeoutMs) {
         return yield* Effect.fail(
-          new RenderApiError(`Render operation timed out after ${options.timeoutMs}ms`),
+          new RenderApiError(
+            `Render operation timed out after ${options.timeoutMs}ms`,
+          ),
         );
       }
       yield* Effect.sleep(`${delay} millis`);
@@ -274,7 +292,9 @@ export const createRenderFetch = (
   options: RenderFetchOptions = {},
 ): typeof globalThis.fetch => {
   const fetchImpl = options.fetch ?? globalThis.fetch;
-  const sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+  const sleep =
+    options.sleep ??
+    ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const now = options.now ?? Date.now;
   let gate: Promise<void> = Promise.resolve();
   let nextRequestAt = 0;
@@ -284,7 +304,8 @@ export const createRenderFetch = (
       return Promise.reject(signal.reason ?? new Error("Request aborted"));
     }
     return new Promise<void>((resolve, reject) => {
-      const onAbort = () => reject(signal.reason ?? new Error("Request aborted"));
+      const onAbort = () =>
+        reject(signal.reason ?? new Error("Request aborted"));
       signal.addEventListener("abort", onAbort, { once: true });
       Promise.resolve()
         .then(() => sleep(milliseconds))
@@ -324,10 +345,14 @@ export const createRenderFetch = (
       }
 
       const retryableStatus =
-        safeMethod && (response.status === 429 || [502, 503, 504].includes(response.status));
+        safeMethod &&
+        (response.status === 429 || [502, 503, 504].includes(response.status));
       if (!retryableStatus || attempt >= backoffSeconds.length) return response;
 
-      const retryAfter = parseRetryAfter(response.headers.get("retry-after"), now());
+      const retryAfter = parseRetryAfter(
+        response.headers.get("retry-after"),
+        now(),
+      );
       await response.body?.cancel().catch(() => undefined);
       await pause(
         retryAfter ?? backoffSeconds[attempt]! * 1_000,
@@ -339,19 +364,22 @@ export const createRenderFetch = (
 
 const normalizeBaseUrl = (url: string): string => url.replace(/\/+$/, "");
 
-const parseRetryAfter = (value: string | null, now: number): number | undefined => {
+const parseRetryAfter = (
+  value: string | null,
+  now: number,
+): number | undefined => {
   if (!value) return undefined;
   const seconds = Number(value);
-  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1_000, 120_000);
+  if (Number.isFinite(seconds) && seconds >= 0)
+    return Math.min(seconds * 1_000, 120_000);
   const date = Date.parse(value);
-  return Number.isNaN(date) ? undefined : Math.min(Math.max(0, date - now), 120_000);
+  return Number.isNaN(date)
+    ? undefined
+    : Math.min(Math.max(0, date - now), 120_000);
 };
 
 const safeRequestId = (value: string | null): string | undefined =>
-  value !== null && /^[A-Za-z0-9_-]{1,100}$/.test(value)
-    ? value
-    : undefined;
+  value !== null && /^[A-Za-z0-9_-]{1,100}$/.test(value) ? value : undefined;
 
 const safeErrorMessage = (status: number): string =>
   `Render API returned ${status}`;
-

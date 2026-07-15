@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Stack } from "alchemy/Stack";
+import { Stack, type StackSpec } from "alchemy/Stack";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
@@ -7,9 +7,8 @@ import { RecoverPostgres, RunTask } from "../src/Actions.js";
 import { layer as apiLayer } from "../src/Api/Api.js";
 import { fromApiKey } from "../src/Credentials.js";
 
-const runPromise = Effect.runPromise as <A>(
-  effect: Effect.Effect<A, any, any>,
-) => Promise<A>;
+const runPromise = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.runPromise(effect as Effect.Effect<A, E>);
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -44,12 +43,18 @@ describe("at-least-once Actions", () => {
       datadogApiKey: Redacted.make("datadog-secret"),
       datadogSite: "datadoghq.com",
     };
-    const stack = { resources: {}, actions: {} } as any;
+    const stack: Omit<StackSpec, "output"> = {
+      name: "test",
+      stage: "test",
+      resources: {},
+      bindings: {},
+      actions: {},
+    };
 
     const result = await runPromise(
       Effect.gen(function* () {
         yield* RecoverPostgres("recover-db", input);
-        const action = stack.actions["recover-db"];
+        const action = stack.actions["recover-db"]!;
         return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
@@ -84,14 +89,21 @@ describe("at-least-once Actions", () => {
       task: "workflow/send-email",
       input: Redacted.make({ recipient: "secret@example.com" }),
     };
-    const stack = { resources: {}, actions: {} } as any;
+    const stack: Omit<StackSpec, "output"> = {
+      name: "test",
+      stage: "test",
+      resources: {},
+      bindings: {},
+      actions: {},
+    };
     await runPromise(
       Effect.gen(function* () {
         yield* RunTask("run-task", input);
-        expect(JSON.stringify(stack.actions["run-task"].Input)).not.toContain(
+        const action = stack.actions["run-task"]!;
+        expect(JSON.stringify(action.Input)).not.toContain(
           "secret@example.com",
         );
-        return yield* stack.actions["run-task"].Run(input);
+        return yield* action.Run(input);
       }).pipe(
         Effect.provideService(Stack, stack),
         Effect.provide(withApi(fetch)),

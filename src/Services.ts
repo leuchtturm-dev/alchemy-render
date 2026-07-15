@@ -4,12 +4,7 @@ import { poll, RenderApiError } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import { restProvider, type CommonAttributes } from "./RestResource.js";
 
-export type Region =
-  | "frankfurt"
-  | "oregon"
-  | "ohio"
-  | "singapore"
-  | "virginia";
+export type Region = "frankfurt" | "oregon" | "ohio" | "singapore" | "virginia";
 export type ServiceRuntime =
   | "docker"
   | "elixir"
@@ -125,18 +120,28 @@ export interface WebServiceProps extends ServiceCoreProps, ServiceSourceProps {
   readonly plan?: ServicePlan;
   readonly region?: Region;
   readonly healthCheckPath?: string;
-  readonly maintenanceMode?: { readonly enabled: boolean; readonly uri: string };
+  readonly maintenanceMode?: {
+    readonly enabled: boolean;
+    readonly uri: string;
+  };
   readonly renderSubdomainPolicy?: "enabled" | "disabled";
   readonly ipAllowList?: readonly ServiceIpRule[];
   readonly cache?: {
-    readonly profile: "no-cache" | "origin-controlled" | "origin-controlled-all";
+    readonly profile:
+      | "no-cache"
+      | "origin-controlled"
+      | "origin-controlled-all";
   };
 }
-export interface PrivateServiceProps extends ServiceCoreProps, ServiceSourceProps {
+export interface PrivateServiceProps
+  extends ServiceCoreProps,
+    ServiceSourceProps {
   readonly plan?: PaidServicePlan;
   readonly region?: Region;
 }
-export interface BackgroundWorkerProps extends ServiceCoreProps, ServiceSourceProps {
+export interface BackgroundWorkerProps
+  extends ServiceCoreProps,
+    ServiceSourceProps {
   readonly plan?: PaidServicePlan;
   readonly region?: Region;
 }
@@ -192,7 +197,13 @@ type ServiceResource<
   T extends string,
   P extends object,
   K extends ServiceAttributes["type"],
-> = Resource.Resource<T, P, ServiceAttributes & { readonly type: K }, never, Providers>;
+> = Resource.Resource<
+  T,
+  P,
+  ServiceAttributes & { readonly type: K },
+  never,
+  Providers
+>;
 
 /** A Render public web service. Child configuration is managed separately. @resource */
 export type WebService = ServiceResource<
@@ -207,17 +218,24 @@ export type PrivateService = ServiceResource<
   PrivateServiceProps,
   "private_service"
 >;
-export const PrivateService = Resource.Resource<PrivateService>("Render.PrivateService");
+export const PrivateService = Resource.Resource<PrivateService>(
+  "Render.PrivateService",
+);
 /** A continuously running background worker. @resource */
 export type BackgroundWorker = ServiceResource<
   "Render.BackgroundWorker",
   BackgroundWorkerProps,
   "background_worker"
 >;
-export const BackgroundWorker =
-  Resource.Resource<BackgroundWorker>("Render.BackgroundWorker");
+export const BackgroundWorker = Resource.Resource<BackgroundWorker>(
+  "Render.BackgroundWorker",
+);
 /** A scheduled Render cron service. @resource */
-export type CronJob = ServiceResource<"Render.CronJob", CronJobProps, "cron_job">;
+export type CronJob = ServiceResource<
+  "Render.CronJob",
+  CronJobProps,
+  "cron_job"
+>;
 export const CronJob = Resource.Resource<CronJob>("Render.CronJob");
 /** A Render static site. Headers and routes are managed separately. @resource */
 export type StaticSite = ServiceResource<
@@ -265,7 +283,8 @@ const validateSource = (props: ServiceSourceProps) => {
 
 const sourceBody = (props: ServiceSourceProps, ownerId: string) => {
   validateSource(props);
-  if (props.runtime !== "image") return { repo: props.repo, branch: props.branch };
+  if (props.runtime !== "image")
+    return { repo: props.repo, branch: props.branch };
   if (!props.image) {
     throw new Error("Render image services require image.imagePath");
   }
@@ -280,7 +299,12 @@ const sourceBody = (props: ServiceSourceProps, ownerId: string) => {
 
 const createDetails = (
   kind: ServiceAttributes["type"],
-  props: WebServiceProps | PrivateServiceProps | BackgroundWorkerProps | CronJobProps | StaticSiteProps,
+  props:
+    | WebServiceProps
+    | PrivateServiceProps
+    | BackgroundWorkerProps
+    | CronJobProps
+    | StaticSiteProps,
 ) => {
   if (kind === "static_site") {
     const site = props as StaticSiteProps;
@@ -315,7 +339,8 @@ const createDetails = (
       ? {
           healthCheckPath: (service as WebServiceProps).healthCheckPath,
           maintenanceMode: (service as WebServiceProps).maintenanceMode,
-          renderSubdomainPolicy: (service as WebServiceProps).renderSubdomainPolicy,
+          renderSubdomainPolicy: (service as WebServiceProps)
+            .renderSubdomainPolicy,
           ipAllowList: (service as WebServiceProps).ipAllowList,
         }
       : {}),
@@ -327,7 +352,12 @@ const createDetails = (
 
 const updateDetails = (
   kind: ServiceAttributes["type"],
-  props: WebServiceProps | PrivateServiceProps | BackgroundWorkerProps | CronJobProps | StaticSiteProps,
+  props:
+    | WebServiceProps
+    | PrivateServiceProps
+    | BackgroundWorkerProps
+    | CronJobProps
+    | StaticSiteProps,
 ) => {
   const details = createDetails(kind, props) as Record<string, unknown>;
   delete details.region;
@@ -357,9 +387,23 @@ const updateDetails = (
   return details;
 };
 
+type ManagedServiceProps =
+  | WebServiceProps
+  | PrivateServiceProps
+  | BackgroundWorkerProps
+  | CronJobProps
+  | StaticSiteProps;
+
+type ManagedService =
+  | WebService
+  | PrivateService
+  | BackgroundWorker
+  | CronJob
+  | StaticSite;
+
 const createBody = (
   kind: ServiceAttributes["type"],
-  props: any,
+  props: ManagedServiceProps,
   name: string,
   ownerId: string,
 ) => ({
@@ -372,13 +416,13 @@ const createBody = (
   buildFilter: props.buildFilter,
   ...(kind === "static_site"
     ? { repo: props.repo, branch: props.branch }
-    : sourceBody(props, ownerId)),
+    : sourceBody(props as ServiceSourceProps, ownerId)),
   serviceDetails: createDetails(kind, props),
 });
 
 const updateBody = (
   kind: ServiceAttributes["type"],
-  props: any,
+  props: ManagedServiceProps,
   name: string,
   ownerId: string,
 ) => ({
@@ -388,7 +432,7 @@ const updateBody = (
   buildFilter: props.buildFilter ?? { paths: [], ignoredPaths: [] },
   ...(kind === "static_site"
     ? { repo: props.repo, branch: props.branch }
-    : sourceBody(props, ownerId)),
+    : sourceBody(props as ServiceSourceProps, ownerId)),
   serviceDetails: updateDetails(kind, props),
 });
 
@@ -420,8 +464,7 @@ const observe = (
   };
   if (kind !== "cron_job") {
     details.previews = rawDetails.previews ?? { generation: "off" };
-    details.maxShutdownDelaySeconds =
-      rawDetails.maxShutdownDelaySeconds ?? 30;
+    details.maxShutdownDelaySeconds = rawDetails.maxShutdownDelaySeconds ?? 30;
   }
   if (kind === "web_service") {
     details.healthCheckPath = rawDetails.healthCheckPath ?? "";
@@ -459,11 +502,16 @@ const observe = (
   };
 };
 
-const attributes = (kind: ServiceAttributes["type"]) =>
-  (entity: Record<string, unknown>, fallback: { id: string; ownerId: string; previous?: ServiceAttributes }) => {
+const attributes =
+  <K extends ServiceAttributes["type"]>(kind: K) =>
+  (
+    entity: Record<string, unknown>,
+    fallback: { id: string; ownerId: string; previous?: ServiceAttributes },
+  ): ServiceAttributes & { readonly type: K } => {
     const id = typeof entity.id === "string" ? entity.id : fallback.id;
     const details = record(entity.serviceDetails);
-    const region = typeof details.region === "string" ? details.region : undefined;
+    const region =
+      typeof details.region === "string" ? details.region : undefined;
     return {
       id,
       serviceId: id,
@@ -476,7 +524,8 @@ const attributes = (kind: ServiceAttributes["type"]) =>
       ...(typeof entity.dashboardUrl === "string"
         ? { dashboardUrl: entity.dashboardUrl }
         : {}),
-      ...(entity.suspended === "suspended" || entity.suspended === "not_suspended"
+      ...(entity.suspended === "suspended" ||
+      entity.suspended === "not_suspended"
         ? { suspended: entity.suspended }
         : {}),
       ...(typeof details.runtime === "string"
@@ -492,27 +541,40 @@ const attributes = (kind: ServiceAttributes["type"]) =>
         : fallback.previous?.deployId
           ? { deployId: fallback.previous.deployId }
           : {}),
-      ...(typeof entity.createdAt === "string" ? { createdAt: entity.createdAt } : {}),
-      ...(typeof entity.updatedAt === "string" ? { updatedAt: entity.updatedAt } : {}),
-    } as any;
+      ...(typeof entity.createdAt === "string"
+        ? { createdAt: entity.createdAt }
+        : {}),
+      ...(typeof entity.updatedAt === "string"
+        ? { updatedAt: entity.updatedAt }
+        : {}),
+    };
   };
 
-const provider = (resource: any, kind: ServiceAttributes["type"]) =>
-  restProvider(resource, {
+const provider = <R extends ManagedService>(
+  resource: Resource.ResourceClass<R>,
+  kind: R["Attributes"]["type"],
+) => {
+  const makeAttributes = (
+    entity: Record<string, unknown>,
+    fallback: { id: string; ownerId: string; previous?: R["Attributes"] },
+  ): R["Attributes"] => attributes(kind)(entity, fallback) as R["Attributes"];
+
+  return restProvider(resource, {
     collection: "/services",
     item: (id: string) => `/services/${encodeURIComponent(id)}`,
     ownerScoped: true,
-    stables: ["serviceId"],
+    stables: ["serviceId"] as Extract<keyof R["Attributes"], string>[],
     filter: (entity: Record<string, unknown>) => entity.type === kind,
     lookupQuery: () => ({ type: kind }),
-    immutable: ["environmentId", "region"],
-    body: (props: any, name: string, ownerId: string) =>
-      createBody(kind, props, name, ownerId),
-    updateBody: (props: any, name: string, ownerId: string) =>
+    immutable: (kind === "static_site"
+      ? ["environmentId"]
+      : ["environmentId", "region"]) as (keyof R["Props"])[],
+    body: (props, name, ownerId) => createBody(kind, props, name, ownerId),
+    updateBody: (props, name, ownerId) =>
       updateBody(kind, props, name, ownerId),
     observe: (entity: Record<string, unknown>) => observe(entity, kind),
-    attributes: attributes(kind),
-    finalize: (service: ServiceAttributes, props: ServiceCoreProps, api, phase) =>
+    attributes: makeAttributes,
+    finalize: (service, props, api, phase) =>
       Effect.gen(function* () {
         let current = service;
         if (
@@ -527,7 +589,7 @@ const provider = (resource: any, kind: ServiceAttributes["type"]) =>
               serviceDetails: { cache: (props as WebServiceProps).cache },
             },
           });
-          current = attributes(kind)(record(patched), {
+          current = makeAttributes(record(patched), {
             id: service.serviceId,
             ownerId: service.ownerId ?? api.ownerId,
             previous: service,
@@ -545,10 +607,12 @@ const provider = (resource: any, kind: ServiceAttributes["type"]) =>
           "pre_deploy_failed",
         ]);
         const deploy = yield* poll(
-          api.request({
-            method: "GET",
-            path: `/services/${encodeURIComponent(current.serviceId)}/deploys/${encodeURIComponent(current.deployId)}`,
-          }).pipe(Effect.map((value) => value as Record<string, unknown>)),
+          api
+            .request({
+              method: "GET",
+              path: `/services/${encodeURIComponent(current.serviceId)}/deploys/${encodeURIComponent(current.deployId)}`,
+            })
+            .pipe(Effect.map((value) => value as Record<string, unknown>)),
           {
             timeoutMs: props.deployTimeoutMs ?? 3 * 60 * 60 * 1_000,
             while: (value) => !terminal.has(String(value.status ?? "")),
@@ -564,6 +628,7 @@ const provider = (resource: any, kind: ServiceAttributes["type"]) =>
         return current;
       }),
   });
+};
 
 export const WebServiceProvider = () => provider(WebService, "web_service");
 export const PrivateServiceProvider = () =>

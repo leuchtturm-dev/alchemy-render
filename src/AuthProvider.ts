@@ -7,10 +7,7 @@ import {
   AuthProviderLayer,
   type ConfigureContext,
 } from "alchemy/Auth/AuthProvider";
-import {
-  CredentialsStore,
-  displayRedacted,
-} from "alchemy/Auth/Credentials";
+import { CredentialsStore, displayRedacted } from "alchemy/Auth/Credentials";
 import {
   getEnv,
   getEnvRedactedRequired,
@@ -161,13 +158,19 @@ export const RenderAuth = AuthProviderLayer<
     const login = (profileName: string, config: RenderAuthConfig) =>
       Match.value(config)
         .pipe(
-          Match.when({ method: "env" }, () => read(profileName, config).pipe(Effect.asVoid)),
+          Match.when({ method: "env" }, () =>
+            read(profileName, config).pipe(Effect.asVoid),
+          ),
           Match.when({ method: "stored" }, () =>
-            store.read<RenderStoredCredentials>(profileName, STORAGE_KEY).pipe(
-              Effect.flatMap((credentials) =>
-                credentials ? Effect.void : loginStored(profileName).pipe(Effect.asVoid),
+            store
+              .read<RenderStoredCredentials>(profileName, STORAGE_KEY)
+              .pipe(
+                Effect.flatMap((credentials) =>
+                  credentials
+                    ? Effect.void
+                    : loginStored(profileName).pipe(Effect.asVoid),
+                ),
               ),
-            ),
           ),
           Match.exhaustive,
         )
@@ -183,7 +186,11 @@ export const RenderAuth = AuthProviderLayer<
         Match.when({ method: "stored" }, () =>
           store
             .delete(profileName, STORAGE_KEY)
-            .pipe(Effect.andThen(Clank.success("Render: stored credentials removed."))),
+            .pipe(
+              Effect.andThen(
+                Clank.success("Render: stored credentials removed."),
+              ),
+            ),
         ),
         Match.exhaustive,
       );

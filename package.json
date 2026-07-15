@@ -13,7 +13,13 @@
   "bugs": {
     "url": "https://github.com/leuchtturm-dev/alchemy-render/issues"
   },
-  "keywords": ["alchemy", "render", "infrastructure-as-code", "iac", "provider"],
+  "keywords": [
+    "alchemy",
+    "render",
+    "infrastructure-as-code",
+    "iac",
+    "provider"
+  ],
   "files": [
     "dist",
     "src",

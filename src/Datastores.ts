@@ -1,7 +1,7 @@
 import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { poll, type RenderApiClient } from "./Api/Api.js";
+import { poll, RenderApiError, type RenderApiClient } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
   digest,
@@ -119,8 +119,13 @@ export interface DatastoreAttributes extends CommonAttributes {
   readonly datadogSite?: string;
 }
 
-type Store<T extends string, P extends object> =
-  Resource.Resource<T, P, DatastoreAttributes, never, Providers>;
+type Store<T extends string, P extends object> = Resource.Resource<
+  T,
+  P,
+  DatastoreAttributes,
+  never,
+  Providers
+>;
 
 /** A managed Render Postgres database. Connection values are Redacted. @resource */
 export type Postgres = Store<"Render.Postgres", PostgresProps>;
@@ -166,8 +171,12 @@ const attrs = (
     ...(string(entity.environmentId)
       ? { environmentId: string(entity.environmentId)! }
       : {}),
-    ...(string(entity.createdAt) ? { createdAt: string(entity.createdAt)! } : {}),
-    ...(string(entity.updatedAt) ? { updatedAt: string(entity.updatedAt)! } : {}),
+    ...(string(entity.createdAt)
+      ? { createdAt: string(entity.createdAt)! }
+      : {}),
+    ...(string(entity.updatedAt)
+      ? { updatedAt: string(entity.updatedAt)! }
+      : {}),
     ...(fallback.previous?.connectionInfo
       ? { connectionInfo: fallback.previous.connectionInfo }
       : {}),
@@ -196,10 +205,14 @@ const redactConnectionInfo = (value: unknown): DatastoreConnectionInfo => {
       ? { externalConnectionString: redact("externalConnectionString")! }
       : {}),
     ...(redact("internalConnectionPoolString")
-      ? { internalConnectionPoolString: redact("internalConnectionPoolString")! }
+      ? {
+          internalConnectionPoolString: redact("internalConnectionPoolString")!,
+        }
       : {}),
     ...(redact("externalConnectionPoolString")
-      ? { externalConnectionPoolString: redact("externalConnectionPoolString")! }
+      ? {
+          externalConnectionPoolString: redact("externalConnectionPoolString")!,
+        }
       : {}),
     ...(redact("password") ? { password: redact("password")! } : {}),
     ...(command ? { command } : {}),
@@ -238,9 +251,12 @@ const hydrateConnection = (
         previous: current,
       });
     }
-    if (current.status === "unavailable" || current.status === "recovery_failed") {
+    if (
+      current.status === "unavailable" ||
+      current.status === "recovery_failed"
+    ) {
       return yield* Effect.fail(
-        new Error(
+        new RenderApiError(
           `Render ${kind} ${current.datastoreId} ended provisioning in ${current.status}`,
         ),
       );
@@ -288,7 +304,13 @@ export const PostgresProvider = () =>
     item: (id) => `/postgres/${encodeURIComponent(id)}`,
     ownerScoped: true,
     stables: ["datastoreId"],
-    immutable: ["region", "version", "databaseName", "databaseUser", "environmentId"],
+    immutable: [
+      "region",
+      "version",
+      "databaseName",
+      "databaseUser",
+      "environmentId",
+    ],
     attributes: attrs,
     observe: (entity) => ({
       name: entity.name,
@@ -403,4 +425,3 @@ export const RedisProvider = () =>
     finalize: (attributes, _props, api) =>
       hydrateConnection("redis", attributes, api),
   });
-

@@ -1,3 +1,4 @@
+import type { ScopedPlanStatusSession } from "alchemy/Cli/Cli";
 import { describe, expect, it } from "vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -20,7 +21,12 @@ import {
   ServiceNotificationOverride,
   ServiceNotificationOverrideProvider,
 } from "../src/AccountResources.js";
-import { KeyValue, KeyValueProvider, Postgres, PostgresProvider } from "../src/Datastores.js";
+import {
+  KeyValue,
+  KeyValueProvider,
+  Postgres,
+  PostgresProvider,
+} from "../src/Datastores.js";
 import { fromApiKey } from "../src/Credentials.js";
 import {
   Environment,
@@ -47,9 +53,8 @@ import {
   ServiceEnvVarProvider,
 } from "../src/ServiceConfiguration.js";
 
-const runPromise = Effect.runPromise as <A>(
-  effect: Effect.Effect<A, any, any>,
-) => Promise<A>;
+const runPromise = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.runPromise(effect as Effect.Effect<A, E>);
 
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), {
@@ -68,40 +73,39 @@ const withApi = (fetch: typeof globalThis.fetch) =>
     ),
   );
 
-const reconcileInput = <P, A>(news: P, output?: A) =>
-  ({
-    id: "Test",
-    fqn: "Test",
-    instanceId: "00112233445566778899aabbccddeeff",
-    news,
-    olds: output === undefined ? undefined : news,
-    output,
-    bindings: [],
-    session: {},
-  }) as any;
+const session = {} as ScopedPlanStatusSession;
 
-const diffInput = <P, A>(olds: P, news: P, output: A) =>
-  ({
-    id: "Test",
-    fqn: "Test",
-    instanceId: "00112233445566778899aabbccddeeff",
-    olds,
-    news,
-    output,
-    bindings: [],
-    session: {},
-  }) as any;
+const reconcileInput = <P, A>(news: P, output?: A) => ({
+  id: "Test",
+  fqn: "Test",
+  instanceId: "00112233445566778899aabbccddeeff",
+  news,
+  olds: output === undefined ? undefined : news,
+  output,
+  bindings: [],
+  session,
+});
 
-const deleteInput = <P, A>(olds: P, output: A) =>
-  ({
-    id: "Test",
-    fqn: "Test",
-    instanceId: "00112233445566778899aabbccddeeff",
-    olds,
-    output,
-    bindings: [],
-    session: {},
-  }) as any;
+const diffInput = <P, A>(olds: P, news: P, output: A) => ({
+  id: "Test",
+  fqn: "Test",
+  instanceId: "00112233445566778899aabbccddeeff",
+  olds,
+  news,
+  output,
+  oldBindings: [],
+  newBindings: [],
+});
+
+const deleteInput = <P, A>(olds: P, output: A) => ({
+  id: "Test",
+  fqn: "Test",
+  instanceId: "00112233445566778899aabbccddeeff",
+  olds,
+  output,
+  bindings: [],
+  session,
+});
 
 describe("representative resource lifecycles", () => {
   it("creates a service and skips PATCH when observed core configuration is converged", async () => {
@@ -153,15 +157,17 @@ describe("representative resource lifecycles", () => {
     };
     const program = Effect.gen(function* () {
       const provider = yield* WebService.Provider;
-      const created = yield* (provider.reconcile as any)(reconcileInput(props));
-      const converged = yield* (provider.reconcile as any)(
+      const created = yield* provider.reconcile(reconcileInput(props));
+      const converged = yield* provider.reconcile(
         reconcileInput(props, created),
       );
       return { created, converged };
     });
     const result = await runPromise(
       program.pipe(
-        Effect.provide(WebServiceProvider().pipe(Layer.provide(withApi(fetch)))),
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
       ),
     );
 
@@ -179,7 +185,7 @@ describe("representative resource lifecycles", () => {
   });
 
   it("sends the required empty environments collection when creating a Project", async () => {
-    let body: any;
+    let body: unknown;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       if (request.method === "GET") return json([]);
@@ -188,16 +194,18 @@ describe("representative resource lifecycles", () => {
     }) as typeof globalThis.fetch;
     const program = Effect.gen(function* () {
       const provider = yield* Project.Provider;
-      return yield* (provider.reconcile as any)(
-        reconcileInput({ name: "app" }),
-      );
+      return yield* provider.reconcile(reconcileInput({ name: "app" }));
     });
     const result = await runPromise(
       program.pipe(
         Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    expect(body).toEqual({ name: "app", ownerId: "tea-test", environments: [] });
+    expect(body).toEqual({
+      name: "app",
+      ownerId: "tea-test",
+      environments: [],
+    });
     expect(result.projectId).toBe("prj-1");
   });
 
@@ -217,7 +225,7 @@ describe("representative resource lifecycles", () => {
     const props = { environmentId: "evm-1", resourceId: "srv-1" };
     const program = Effect.gen(function* () {
       const provider = yield* EnvironmentResource.Provider;
-      return yield* (provider.reconcile as any)(reconcileInput(props));
+      return yield* provider.reconcile(reconcileInput(props));
     });
     const result = await runPromise(
       program.pipe(
@@ -244,11 +252,8 @@ describe("representative resource lifecycles", () => {
     await runPromise(
       Effect.gen(function* () {
         const provider = yield* EnvironmentResource.Provider;
-        return yield* (provider.delete as any)(
-          deleteInput(
-            { environmentId: "evm-1", resourceId: "srv-1" },
-            output,
-          ),
+        return yield* provider.delete(
+          deleteInput({ environmentId: "evm-1", resourceId: "srv-1" }, output),
         );
       }).pipe(
         Effect.provide(
@@ -300,14 +305,16 @@ describe("representative resource lifecycles", () => {
     };
     const program = Effect.gen(function* () {
       const provider = yield* Postgres.Provider;
-      return yield* (provider.reconcile as any)(reconcileInput(props));
+      return yield* provider.reconcile(reconcileInput(props));
     });
     const result = await runPromise(
       program.pipe(
         Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    expect(Redacted.value(result.connectionInfo.password)).toBe("database-secret");
+    expect(Redacted.value(result.connectionInfo!.password!)).toBe(
+      "database-secret",
+    );
     expect(JSON.stringify(result)).not.toContain("database-secret");
   });
 
@@ -327,7 +334,7 @@ describe("representative resource lifecycles", () => {
     };
     const program = Effect.gen(function* () {
       const provider = yield* RegistryCredential.Provider;
-      return yield* (provider.reconcile as any)(reconcileInput(props));
+      return yield* provider.reconcile(reconcileInput(props));
     });
     const result = await runPromise(
       program.pipe(
@@ -344,21 +351,24 @@ describe("representative resource lifecycles", () => {
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       if (request.method === "GET") return json([]);
-      return json({
-        webhook: {
-          id: "whk-1",
-          name: "deploys",
-          url: "https://example.com/render-hook",
-          enabled: true,
-          eventFilter: ["deploy_started"],
+      return json(
+        {
+          webhook: {
+            id: "whk-1",
+            name: "deploys",
+            url: "https://example.com/render-hook",
+            enabled: true,
+            eventFilter: ["deploy_started"],
+          },
+          secret: "webhook-secret",
         },
-        secret: "webhook-secret",
-      }, 201);
+        201,
+      );
     }) as typeof globalThis.fetch;
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Webhook.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({
             name: "deploys",
             url: "https://example.com/render-hook",
@@ -369,13 +379,13 @@ describe("representative resource lifecycles", () => {
         Effect.provide(WebhookProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    expect(Redacted.value(result.signingSecret)).toBe("webhook-secret");
+    expect(Redacted.value(result.signingSecret!)).toBe("webhook-secret");
     expect(JSON.stringify(result)).not.toContain("webhook-secret");
   });
 
   it("preserves omitted stream token digests and clears them explicitly", async () => {
     const methods: string[] = [];
-    const bodies: any[] = [];
+    const bodies: unknown[] = [];
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       methods.push(request.method);
@@ -404,7 +414,7 @@ describe("representative resource lifecycles", () => {
     const resourceResult = await runPromise(
       Effect.gen(function* () {
         const provider = yield* ResourceLogStream.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput(resourceProps, previous),
         );
       }).pipe(
@@ -420,7 +430,7 @@ describe("representative resource lifecycles", () => {
     const ownerResult = await runPromise(
       Effect.gen(function* () {
         const provider = yield* OwnerLogStream.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput(
             {
               endpoint: "https://logs.example.com/new",
@@ -444,7 +454,7 @@ describe("representative resource lifecycles", () => {
     const metricsResult = await runPromise(
       Effect.gen(function* () {
         const provider = yield* MetricsStream.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput(
             {
               provider: "CUSTOM" as const,
@@ -468,7 +478,7 @@ describe("representative resource lifecycles", () => {
     const clearDiff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* ResourceLogStream.Provider;
-        return yield* (provider.diff as any)(
+        return yield* provider.diff!(
           diffInput(
             resourceProps,
             { ...resourceProps, token: null },
@@ -507,7 +517,7 @@ describe("representative resource lifecycles", () => {
     };
     const program = Effect.gen(function* () {
       const provider = yield* ServiceNotificationOverride.Provider;
-      yield* (provider.delete as any)(deleteInput(olds, output));
+      yield* provider.delete(deleteInput(olds, output));
     });
     await runPromise(
       program.pipe(
@@ -572,10 +582,8 @@ describe("representative resource lifecycles", () => {
     const web = await runPromise(
       Effect.gen(function* () {
         const provider = yield* WebService.Provider;
-        const listed = yield* (provider.list as any)();
-        const reconciled = yield* (provider.reconcile as any)(
-          reconcileInput(props),
-        );
+        const listed = yield* provider.list();
+        const reconciled = yield* provider.reconcile(reconcileInput(props));
         return { listed, reconciled };
       }).pipe(
         Effect.provide(
@@ -586,16 +594,16 @@ describe("representative resource lifecycles", () => {
     const workers = await runPromise(
       Effect.gen(function* () {
         const provider = yield* BackgroundWorker.Provider;
-        return yield* (provider.list as any)();
+        return yield* provider.list();
       }).pipe(
         Effect.provide(
           BackgroundWorkerProvider().pipe(Layer.provide(withApi(fetch))),
         ),
       ),
     );
-    expect(web.listed.map((item: any) => item.serviceId)).toEqual(["srv-web"]);
+    expect(web.listed.map((item) => item.serviceId)).toEqual(["srv-web"]);
     expect(web.reconciled.serviceId).toBe("srv-web");
-    expect(workers.map((item: any) => item.serviceId)).toEqual(["srv-worker"]);
+    expect(workers.map((item) => item.serviceId)).toEqual(["srv-worker"]);
     expect(methods.every((method) => method === "GET")).toBe(true);
   });
 
@@ -623,10 +631,8 @@ describe("representative resource lifecycles", () => {
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Environment.Provider;
-        const listed = yield* (provider.list as any)();
-        const reconciled = yield* (provider.reconcile as any)(
-          reconcileInput(props),
-        );
+        const listed = yield* provider.list();
+        const reconciled = yield* provider.reconcile(reconcileInput(props));
         return { listed, reconciled };
       }).pipe(
         Effect.provide(
@@ -659,9 +665,15 @@ describe("representative resource lifecycles", () => {
     const diff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Route.Provider;
-        return yield* (provider.diff as any)(diffInput(olds, news, output));
+        return yield* provider.diff!(diffInput(olds, news, output));
       }).pipe(
-        Effect.provide(RouteProvider().pipe(Layer.provide(withApi(async () => json({}) as any)))),
+        Effect.provide(
+          RouteProvider().pipe(
+            Layer.provide(
+              withApi((async () => json({})) as typeof globalThis.fetch),
+            ),
+          ),
+        ),
       ),
     );
     expect(diff).toEqual({ action: "replace" });
@@ -686,11 +698,13 @@ describe("representative resource lifecycles", () => {
     const diff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* WebService.Provider;
-        return yield* (provider.diff as any)(diffInput(props, props, output));
+        return yield* provider.diff!(diffInput(props, props, output));
       }).pipe(
         Effect.provide(
           WebServiceProvider().pipe(
-            Layer.provide(withApi((async () => json({})) as typeof globalThis.fetch)),
+            Layer.provide(
+              withApi((async () => json({})) as typeof globalThis.fetch),
+            ),
           ),
         ),
       ),
@@ -712,7 +726,7 @@ describe("representative resource lifecycles", () => {
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* ServiceEnvVar.Provider;
-        return yield* (provider.reconcile as any)(reconcileInput(props));
+        return yield* provider.reconcile(reconcileInput(props));
       }).pipe(
         Effect.provide(
           ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
@@ -724,15 +738,15 @@ describe("representative resource lifecycles", () => {
   });
 
   it("normalizes omitted autoscaling criteria to Render's complete shape", async () => {
-    let body: any;
+    let body: { criteria?: unknown } | undefined;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      body = await new Request(input, init).json();
+      body = (await new Request(input, init).json()) as { criteria?: unknown };
       return json({});
     }) as typeof globalThis.fetch;
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Autoscaling.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({
             serviceId: "srv-1",
             min: 1,
@@ -746,11 +760,11 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     );
-    expect(body.criteria).toEqual({
+    expect(body?.criteria).toEqual({
       cpu: { enabled: true, percentage: 70 },
       memory: { enabled: false, percentage: 0 },
     });
-    expect(result.criteria).toEqual(body.criteria);
+    expect(result.criteria).toEqual(body?.criteria);
   });
 
   it("waits for Key Value readiness before reading connection information", async () => {
@@ -773,7 +787,7 @@ describe("representative resource lifecycles", () => {
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* KeyValue.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({
             name: "cache",
             plan: "starter" as const,
@@ -791,7 +805,7 @@ describe("representative resource lifecycles", () => {
       "GET /v1/key-value/kv-1/connection-info",
     ]);
     expect(
-      Redacted.value(result.connectionInfo.internalConnectionString),
+      Redacted.value(result.connectionInfo!.internalConnectionString!),
     ).toContain("secret");
   });
 
@@ -829,7 +843,7 @@ describe("representative resource lifecycles", () => {
     const diff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Postgres.Provider;
-        return yield* (provider.diff as any)(diffInput(props, props, output));
+        return yield* provider.diff!(diffInput(props, props, output));
       }).pipe(
         Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
@@ -837,21 +851,27 @@ describe("representative resource lifecycles", () => {
     const changed = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Postgres.Provider;
-        return yield* (provider.diff as any)(
-          diffInput(props, { ...props, datadogApiKey: Redacted.make("rotated") }, output),
+        return yield* provider.diff!(
+          diffInput(
+            props,
+            { ...props, datadogApiKey: Redacted.make("rotated") },
+            output,
+          ),
         );
       }).pipe(
         Effect.provide(PostgresProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    let patchBody: any;
+    let patchBody: Record<string, unknown> | undefined;
     const writingFetch = (async (
       input: RequestInfo | URL,
       init?: RequestInit,
     ) => {
       const request = new Request(input, init);
       if (request.url.endsWith("/connection-info")) return json({});
-      if (request.method === "PATCH") patchBody = await request.json();
+      if (request.method === "PATCH") {
+        patchBody = (await request.json()) as Record<string, unknown>;
+      }
       return json({
         id: "dpg-1",
         name: "db",
@@ -872,7 +892,7 @@ describe("representative resource lifecycles", () => {
         const provider = yield* Postgres.Provider;
         const input = reconcileInput(rotated, output);
         input.olds = props;
-        return yield* (provider.reconcile as any)(input);
+        return yield* provider.reconcile(input);
       }).pipe(
         Effect.provide(
           PostgresProvider().pipe(Layer.provide(withApi(writingFetch))),
@@ -881,16 +901,16 @@ describe("representative resource lifecycles", () => {
     );
     expect(diff).toBeUndefined();
     expect(changed).toEqual({ action: "update" });
-    expect(patchBody.datadogAPIKey).toBe("rotated");
+    expect(patchBody?.datadogAPIKey).toBe("rotated");
     expect(JSON.stringify(output)).not.toContain("datadog-secret");
   });
 
   it("stores a Workflow environment digest and replaces on value-only changes", async () => {
-    let body: any;
+    let body: Record<string, unknown> | undefined;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       if (request.method === "GET") return json([]);
-      body = await request.json();
+      body = (await request.json()) as Record<string, unknown>;
       return json({ id: "wfl-1", name: "workflow", region: "oregon" }, 201);
     }) as typeof globalThis.fetch;
     const props = {
@@ -908,11 +928,14 @@ describe("representative resource lifecycles", () => {
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Workflow.Provider;
-        const created = yield* (provider.reconcile as any)(reconcileInput(props));
-        const changed = yield* (provider.diff as any)(
+        const created = yield* provider.reconcile(reconcileInput(props));
+        const changed = yield* provider.diff!(
           diffInput(
             props,
-            { ...props, envVars: [{ key: "TOKEN", value: Redacted.make("second") }] },
+            {
+              ...props,
+              envVars: [{ key: "TOKEN", value: Redacted.make("second") }],
+            },
             created,
           ),
         );
@@ -921,27 +944,34 @@ describe("representative resource lifecycles", () => {
         Effect.provide(WorkflowProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    expect(body.envVars).toEqual([{ key: "TOKEN", value: "first" }]);
+    expect(body?.envVars).toEqual([{ key: "TOKEN", value: "first" }]);
     expect(result.created.envVarsDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(result.created)).not.toContain("first");
     expect(result.changed).toEqual({ action: "replace" });
   });
 
   it("sends the required initial instance count for private services and workers", async () => {
-    const bodies: any[] = [];
+    const bodies: Array<{ serviceDetails?: { numInstances?: number } }> = [];
     const fetchFor = (type: "private_service" | "background_worker") =>
       (async (input: RequestInfo | URL, init?: RequestInit) => {
         const request = new Request(input, init);
         if (request.method === "GET") return json([]);
-        bodies.push(await request.json());
-        return json({
-          service: {
-            id: type === "private_service" ? "srv-private" : "srv-worker",
-            name: type === "private_service" ? "private" : "worker",
-            type,
-            serviceDetails: { runtime: "node" },
+        bodies.push(
+          (await request.json()) as {
+            serviceDetails?: { numInstances?: number };
           },
-        }, 201);
+        );
+        return json(
+          {
+            service: {
+              id: type === "private_service" ? "srv-private" : "srv-worker",
+              name: type === "private_service" ? "private" : "worker",
+              type,
+              serviceDetails: { runtime: "node" },
+            },
+          },
+          201,
+        );
       }) as typeof globalThis.fetch;
     const source = {
       repo: "https://github.com/acme/app",
@@ -952,7 +982,7 @@ describe("representative resource lifecycles", () => {
     await runPromise(
       Effect.gen(function* () {
         const provider = yield* PrivateService.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({ ...source, name: "private" }),
         );
       }).pipe(
@@ -966,7 +996,7 @@ describe("representative resource lifecycles", () => {
     await runPromise(
       Effect.gen(function* () {
         const provider = yield* BackgroundWorker.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({ ...source, name: "worker" }),
         );
       }).pipe(
@@ -977,9 +1007,8 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     );
-    expect(bodies.map((body) => body.serviceDetails.numInstances)).toEqual([
-      1,
-      1,
+    expect(bodies.map((body) => body.serviceDetails?.numInstances)).toEqual([
+      1, 1,
     ]);
   });
 
@@ -1009,7 +1038,7 @@ describe("representative resource lifecycles", () => {
     const diff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* WebService.Provider;
-        return yield* (provider.diff as any)(
+        return yield* provider.diff!(
           diffInput(props, props, {
             id: "srv-docker",
             serviceId: "srv-docker",
@@ -1028,7 +1057,7 @@ describe("representative resource lifecycles", () => {
 
   it("applies web cache configuration immediately after service creation", async () => {
     const methods: string[] = [];
-    const bodies: any[] = [];
+    const bodies: unknown[] = [];
     const service = {
       id: "srv-1",
       name: "api",
@@ -1041,12 +1070,15 @@ describe("representative resource lifecycles", () => {
       methods.push(request.method);
       if (request.method === "GET") return json([]);
       bodies.push(await request.json());
-      return json(request.method === "POST" ? { service } : service, request.method === "POST" ? 201 : 200);
+      return json(
+        request.method === "POST" ? { service } : service,
+        request.method === "POST" ? 201 : 200,
+      );
     }) as typeof globalThis.fetch;
     await runPromise(
       Effect.gen(function* () {
         const provider = yield* WebService.Provider;
-        return yield* (provider.reconcile as any)(
+        return yield* provider.reconcile(
           reconcileInput({
             name: "api",
             repo: "https://github.com/acme/app",
@@ -1057,7 +1089,9 @@ describe("representative resource lifecycles", () => {
           }),
         );
       }).pipe(
-        Effect.provide(WebServiceProvider().pipe(Layer.provide(withApi(fetch)))),
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
       ),
     );
     expect(methods).toEqual(["GET", "POST", "PATCH"]);

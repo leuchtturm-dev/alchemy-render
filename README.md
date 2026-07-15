@@ -107,26 +107,26 @@ The transport never retries unsafe POST/PATCH requests after network or 5xx fail
 
 ## Capability matrix
 
-| Area | Managed Resources |
-|---|---|
-| Services | `WebService`, `PrivateService`, `BackgroundWorker`, `CronJob`, `StaticSite` |
-| Service configuration | `ServiceEnvVar`, `ServiceSecretFile`, `CustomDomain`, `Disk`, `Header`, `Route`, `Autoscaling`, `ServiceNotificationOverride`, `ResourceLogStream` |
-| Datastores | `Postgres`, `KeyValue`, deprecated `Redis` |
-| Projects | `Project`, `Environment`, `EnvironmentResource` |
-| Environment groups | `EnvironmentGroup`, `EnvironmentGroupLink`, `EnvironmentGroupEnvVar`, `EnvironmentGroupSecretFile` |
-| Workspace/account | `DedicatedIp`, `RegistryCredential`, `Webhook`, `OwnerLogStream`, `MetricsStream` |
-| Workflows | `Workflow` |
+### Managed resources
 
-| Area | At-least-once Actions |
-|---|---|
-| Deploys | `Deploy`, `CancelDeploy`, `Rollback` |
-| Services | `PurgeCache`, `SuspendService`, `ResumeService`, `RestartService`, `ScaleService`, `PreviewService`, `VerifyCustomDomain` |
-| Jobs | `RunJob`, `CancelJob`, `RunCronJob`, `CancelCronJobRun` |
-| Disks | `RestoreDiskSnapshot` |
-| Postgres | `SuspendPostgres`, `ResumePostgres`, `RestartPostgres`, `FailoverPostgres`, `RecoverPostgres`, `ExportPostgres`, `RotatePostgresCredentials`, `DeletePostgresUser` |
-| Key Value / Redis | `SuspendKeyValue`, `ResumeKeyValue`, deprecated `SuspendRedis`, `ResumeRedis` |
-| Maintenance | `TriggerMaintenance`, `UpdateMaintenanceSchedule` |
-| Workflows and tasks | `CreateWorkflowVersion`, `RunTask`, `CancelTaskRun` |
+- **Services:** `WebService`, `PrivateService`, `BackgroundWorker`, `CronJob`, `StaticSite`
+- **Service configuration:** `ServiceEnvVar`, `ServiceSecretFile`, `CustomDomain`, `Disk`, `Header`, `Route`, `Autoscaling`, `ServiceNotificationOverride`, `ResourceLogStream`
+- **Datastores:** `Postgres`, `KeyValue`, deprecated `Redis`
+- **Projects:** `Project`, `Environment`, `EnvironmentResource`
+- **Environment groups:** `EnvironmentGroup`, `EnvironmentGroupLink`, `EnvironmentGroupEnvVar`, `EnvironmentGroupSecretFile`
+- **Workspace/account:** `DedicatedIp`, `RegistryCredential`, `Webhook`, `OwnerLogStream`, `MetricsStream`
+- **Workflows:** `Workflow`
+
+### At-least-once actions
+
+- **Deploys:** `Deploy`, `CancelDeploy`, `Rollback`
+- **Services:** `PurgeCache`, `SuspendService`, `ResumeService`, `RestartService`, `ScaleService`, `PreviewService`, `VerifyCustomDomain`
+- **Jobs:** `RunJob`, `CancelJob`, `RunCronJob`, `CancelCronJobRun`
+- **Disks:** `RestoreDiskSnapshot`
+- **Postgres:** `SuspendPostgres`, `ResumePostgres`, `RestartPostgres`, `FailoverPostgres`, `RecoverPostgres`, `ExportPostgres`, `RotatePostgresCredentials`, `DeletePostgresUser`
+- **Key Value / Redis:** `SuspendKeyValue`, `ResumeKeyValue`, deprecated `SuspendRedis`, `ResumeRedis`
+- **Maintenance:** `TriggerMaintenance`, `UpdateMaintenanceSchedule`
+- **Workflows and tasks:** `CreateWorkflowVersion`, `RunTask`, `CancelTaskRun`
 
 The generated client under `Render.Api` covers the complete published OpenAPI document, including read/query endpoints for owners, members, audit logs, deploy history, events, logs, metrics, snapshots, instances, Postgres diagnostics, webhook deliveries, workflow versions, tasks, and task runs.
 
@@ -145,7 +145,7 @@ Some API concepts intentionally are not Resources:
 `Render.Api.RenderApi` exposes both the generated `openapi-fetch` client and the provider's small Effect request client:
 
 ```ts
-const owners = yield* Effect.gen(function* () {
+const owners = Effect.gen(function* () {
   const getApi = yield* Render.Api.RenderApi;
   const api = yield* getApi;
   return yield* Render.Api.call(() => api.client.GET("/owners"));
