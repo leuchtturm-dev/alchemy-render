@@ -174,6 +174,73 @@ describe("declarative service-owned configuration", () => {
     expect(result.deletionRequests).toEqual(["GET /v1/services/srv-1"]);
   });
 
+  it("fails closed when full environment pagination cannot advance", async () => {
+    const env = Object.fromEntries(
+      Array.from({ length: 100 }, (_, index) => [
+        `KEY_${index}`,
+        Redacted.make(`value-${index}`),
+      ]),
+    );
+    const props: WebServiceProps = imageProps(env);
+
+    for (const mode of ["missing", "repeated"] as const) {
+      const methods: string[] = [];
+      const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new Request(input, init);
+        const path = new URL(request.url).pathname;
+        methods.push(`${request.method} ${path}`);
+        if (request.method === "POST" && path.endsWith("/services")) {
+          return json({ service: service(), deployId: "dep-create" }, 201);
+        }
+        if (request.method === "GET" && path.endsWith("/env-vars")) {
+          return json(
+            Object.entries(env).map(([key, value]) => ({
+              envVar: { key, value: Redacted.value(value) },
+              ...(mode === "repeated" ? { cursor: "stale" } : {}),
+            })),
+          );
+        }
+        if (request.method === "GET") return json(service());
+        return json({ message: "unexpected write" }, 500);
+      }) as typeof globalThis.fetch;
+
+      await expect(
+        runPromise(
+          Effect.gen(function* () {
+            const provider = yield* WebService.Provider;
+            const created = yield* provider.reconcile(reconcileInput(props));
+            return yield* provider.diff!({
+              id: "Api",
+              fqn: "Api",
+              instanceId: "00112233445566778899aabbccddeeff",
+              olds: props,
+              news: props,
+              output: created,
+              oldBindings: [],
+              newBindings: [],
+            });
+          }).pipe(
+            Effect.provide(
+              WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+            ),
+          ),
+        ),
+      ).rejects.toThrow(
+        mode === "missing"
+          ? "without a pagination cursor"
+          : "non-advancing pagination cursor",
+      );
+      expect(methods).toEqual([
+        "POST /v1/services",
+        "GET /v1/services/srv-1",
+        "GET /v1/services/srv-1/env-vars",
+        ...(mode === "repeated"
+          ? ["GET /v1/services/srv-1/env-vars"]
+          : []),
+      ]);
+    }
+  });
+
   it("rotates and deletes env with one deployment transition each", async () => {
     let remoteEnv: Record<string, string> = { TOKEN: "first", OLD: "remove" };
     const requests: Array<{ method: string; path: string; body?: unknown }> = [];

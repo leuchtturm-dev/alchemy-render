@@ -258,15 +258,14 @@ const physicalIdentity = (
     : Effect.succeed(explicit);
 };
 
+/**
+ * Bridge Alchemy beta's `Aliases: T | undefined` ResourceClass field to the
+ * exact-optional `Aliases?: T` shape accepted by Provider APIs. The runtime
+ * object is returned intact so future ResourceClass fields are preserved.
+ */
 export const resourceClass = <R extends ResourceLike>(
   resource: ResourceClass<R>,
-): ResourceClassLike<R> => ({
-  Type: resource.Type,
-  Props: resource.Props,
-  Self: resource.Self,
-  Provider: resource.Provider,
-  ...(resource.Aliases === undefined ? {} : { Aliases: resource.Aliases }),
-});
+): ResourceClassLike<R> => resource as unknown as ResourceClassLike<R>;
 
 export const restProvider = <
   R extends ResourceLike<string, object, CommonAttributes>,
@@ -401,6 +400,17 @@ export const restProvider = <
               );
             }
             if (
+              descriptor.paginated !== false &&
+              next === cursor &&
+              rows.length >= 100
+            ) {
+              return yield* Effect.fail(
+                new RenderApiError(
+                  "Render list response reached the requested limit with a non-advancing pagination cursor",
+                ),
+              );
+            }
+            if (
               descriptor.paginated === false ||
               !next ||
               next === cursor ||
@@ -487,6 +497,17 @@ export const restProvider = <
                     return yield* Effect.fail(
                       new RenderApiError(
                         "Render list response reached the requested limit without a pagination cursor",
+                      ),
+                    );
+                  }
+                  if (
+                    descriptor.paginated !== false &&
+                    next === cursor &&
+                    rows.length >= 100
+                  ) {
+                    return yield* Effect.fail(
+                      new RenderApiError(
+                        "Render list response reached the requested limit with a non-advancing pagination cursor",
                       ),
                     );
                   }

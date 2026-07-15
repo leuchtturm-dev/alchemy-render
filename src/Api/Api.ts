@@ -222,6 +222,8 @@ export const ignoreNotFound = (
 
 export interface PaginateOptions<Row> {
   readonly cursor: (row: Row) => string | undefined;
+  /** Fail closed when a full page has no cursor. */
+  readonly pageSize?: number;
   readonly maxItems?: number;
 }
 
@@ -243,7 +245,32 @@ export const paginate = <Row>(
         return rows.slice(0, options.maxItems);
       }
       const nextCursor = options.cursor(next[next.length - 1]!);
-      if (!nextCursor || nextCursor === cursor) return rows;
+      if (!nextCursor) {
+        if (
+          options.pageSize !== undefined &&
+          next.length >= options.pageSize
+        ) {
+          return yield* Effect.fail(
+            new RenderApiError(
+              "Render list response reached the requested limit without a pagination cursor",
+            ),
+          );
+        }
+        return rows;
+      }
+      if (nextCursor === cursor) {
+        if (
+          options.pageSize !== undefined &&
+          next.length >= options.pageSize
+        ) {
+          return yield* Effect.fail(
+            new RenderApiError(
+              "Render list response reached the requested limit with a non-advancing pagination cursor",
+            ),
+          );
+        }
+        return rows;
+      }
       cursor = nextCursor;
     }
   });
@@ -290,7 +317,8 @@ export interface RenderFetchOptions {
  * Render-aware fetch wrapper: one request every 150ms (400/minute), honors
  * rate-limit reset headers, and bounds retries. A 429 explicitly rejects the
  * request and is retried for every method as Render recommends. Unsafe
- * POST/PATCH requests are not replayed after transport or 5xx failures.
+ * POST/PATCH requests and generated-secret PUTs are not replayed after
+ * transport or 5xx failures.
  */
 export const createRenderFetch = (
   options: RenderFetchOptions = {},
@@ -332,9 +360,7 @@ export const createRenderFetch = (
 
   return (async (input: RequestInfo | URL, init?: RequestInit) => {
     const original = new Request(input, init);
-    const safeMethod = ["GET", "HEAD", "PUT", "DELETE", "OPTIONS"].includes(
-      original.method.toUpperCase(),
-    );
+    const replaySafe = await isReplaySafe(original);
     const backoffSeconds = [1, 5, 10, 20, 40, 60, 120];
 
     for (let attempt = 0; ; attempt++) {
@@ -343,14 +369,14 @@ export const createRenderFetch = (
       try {
         response = await fetchImpl(original.clone());
       } catch (error) {
-        if (!safeMethod || attempt >= 2 || original.signal.aborted) throw error;
+        if (!replaySafe || attempt >= 2 || original.signal.aborted) throw error;
         await pause(backoffSeconds[attempt]! * 1_000, original.signal);
         continue;
       }
 
       const retryableStatus =
         response.status === 429 ||
-        (safeMethod && [502, 503, 504].includes(response.status));
+        (replaySafe && [502, 503, 504].includes(response.status));
       if (!retryableStatus || attempt >= backoffSeconds.length) return response;
 
       const current = now();
@@ -372,6 +398,29 @@ export const createRenderFetch = (
 };
 
 const normalizeBaseUrl = (url: string): string => url.replace(/\/+$/, "");
+
+const containsGeneratedValue = (value: unknown): boolean => {
+  if (Array.isArray(value)) return value.some(containsGeneratedValue);
+  if (typeof value !== "object" || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    record.generateValue === true ||
+    Object.values(record).some(containsGeneratedValue)
+  );
+};
+
+const isReplaySafe = async (request: Request): Promise<boolean> => {
+  const method = request.method.toUpperCase();
+  if (["GET", "HEAD", "DELETE", "OPTIONS"].includes(method)) return true;
+  if (method !== "PUT") return false;
+  try {
+    const text = await request.clone().text();
+    return text.length === 0 || !containsGeneratedValue(JSON.parse(text));
+  } catch {
+    // A deterministic opaque PUT remains replayable under HTTP semantics.
+    return true;
+  }
+};
 
 const MAX_RATE_LIMIT_DELAY_MS = 60 * 60 * 1_000;
 

@@ -218,6 +218,31 @@ describe("Render API transport", () => {
     expect(sleeps).toEqual([150, 150]);
   });
 
+  it("does not replay generated-secret PUTs after indeterminate failures", async () => {
+    for (const failure of ["network", "server"] as const) {
+      let calls = 0;
+      const fetch = createRenderFetch({
+        disableRateLimit: true,
+        sleep: async () => {},
+        fetch: (async () => {
+          calls++;
+          if (failure === "network") throw new Error("offline");
+          return new Response(null, { status: 503 });
+        }) as typeof globalThis.fetch,
+      });
+      const request = fetch("https://render.invalid/generated", {
+        method: "PUT",
+        body: JSON.stringify({ generateValue: true }),
+      });
+      if (failure === "network") {
+        await expect(request).rejects.toThrow("offline");
+      } else {
+        expect((await request).status).toBe(503);
+      }
+      expect(calls).toBe(1);
+    }
+  });
+
   it("replays an idempotent PUT body and aborts during backoff", async () => {
     const bodies: string[] = [];
     let calls = 0;
@@ -283,6 +308,32 @@ describe("API utilities and public surface", () => {
     );
     expect(rows.map((row) => row.id)).toEqual(["a", "b", "b"]);
     expect(seen).toEqual([undefined, "b"]);
+  });
+
+  it("fails closed when a full page has no pagination cursor", async () => {
+    await expect(
+      Effect.runPromise(
+        paginate(
+          () => Effect.succeed([{ id: "a" }, { id: "b" }]),
+          { cursor: () => undefined, pageSize: 2 },
+        ),
+      ),
+    ).rejects.toThrow("without a pagination cursor");
+  });
+
+  it("fails closed when a full page repeats its pagination cursor", async () => {
+    await expect(
+      Effect.runPromise(
+        paginate(
+          () =>
+            Effect.succeed([
+              { id: "a", cursor: "stale" },
+              { id: "b", cursor: "stale" },
+            ]),
+          { cursor: (row) => row.cursor, pageSize: 2 },
+        ),
+      ),
+    ).rejects.toThrow("non-advancing pagination cursor");
   });
 
   it("does not resolve credentials until the lazy API effect is run", async () => {

@@ -76,6 +76,8 @@ export interface OwnerLogStreamAttributes extends CommonAttributes {
   readonly endpoint?: string;
   readonly preview?: "send" | "drop";
   readonly tokenDigest?: string;
+  /** Equality marker distinguishing a managed clear from an unknown token. */
+  readonly tokenCleared?: true;
 }
 interface ResourceLogStreamBaseProps {
   readonly resourceId: string;
@@ -122,6 +124,8 @@ export interface MetricsStreamAttributes extends CommonAttributes {
   readonly provider?: MetricsStreamProps["provider"];
   readonly url?: string;
   readonly tokenDigest?: string;
+  /** Equality marker distinguishing a managed clear from an unknown token. */
+  readonly tokenCleared?: true;
 }
 export interface ServiceNotificationOverrideProps {
   readonly serviceId: string;
@@ -469,11 +473,11 @@ export const ResourceLogStreamProvider = () =>
     createPath: (id) => `/logs/streams/resource/${encodeURIComponent(id)}`,
     attributes: resourceLogAttrs,
     remoteDiff: false,
-    sensitiveChanged: (_olds, p, o) =>
+    sensitiveChanged: (olds, p, o) =>
       o.endpoint !== p.endpoint ||
       o.setting !== p.setting ||
       (p.token === null
-        ? o.tokenCleared !== true
+        ? olds.token !== null || o.tokenCleared !== true
         : p.token !== undefined && o.tokenDigest !== digest(p.token)),
     body: (p) => ({
       endpoint: p.endpoint,
@@ -634,6 +638,7 @@ export const OwnerLogStreamProvider = () =>
             ...(previous?.tokenDigest
               ? { tokenDigest: previous.tokenDigest }
               : {}),
+            ...(previous?.tokenCleared ? { tokenCleared: true as const } : {}),
           } satisfies OwnerLogStreamAttributes;
         }).pipe(ignore404);
       return OwnerLogStream.Provider.of({
@@ -641,14 +646,14 @@ export const OwnerLogStreamProvider = () =>
         list: () => read().pipe(Effect.map((v) => (v ? [v] : []))),
         read: ({ output }) =>
           read(output).pipe(Effect.map((v) => (!v || output ? v : Unowned(v)))),
-        diff: ({ news, output }) =>
+        diff: ({ olds, news, output }) =>
           Effect.succeed(
             !isResolved(news) || !output
               ? undefined
               : output.endpoint !== news.endpoint ||
                   output.preview !== news.preview ||
                   (news.token === null
-                    ? output.tokenDigest !== undefined
+                    ? olds.token !== null || output.tokenCleared !== true
                     : news.token !== undefined &&
                       output.tokenDigest !== digest(news.token))
                 ? { action: "update" as const }
@@ -671,6 +676,18 @@ export const OwnerLogStreamProvider = () =>
               },
             }),
           );
+          const tokenDigest =
+            news.token === undefined
+              ? output?.tokenDigest
+              : news.token === null
+                ? undefined
+                : digest(news.token);
+          const tokenCleared =
+            news.token === undefined
+              ? output?.tokenCleared
+              : news.token === null
+                ? true
+                : undefined;
           return {
             id: api.ownerId,
             ownerId: api.ownerId,
@@ -678,11 +695,8 @@ export const OwnerLogStreamProvider = () =>
               ? { endpoint: string(e, "endpoint")! }
               : {}),
             preview: news.preview,
-            ...(news.token
-              ? { tokenDigest: digest(news.token) }
-              : news.token === undefined && output?.tokenDigest
-                ? { tokenDigest: output.tokenDigest }
-                : {}),
+            ...(tokenDigest === undefined ? {} : { tokenDigest }),
+            ...(tokenCleared ? { tokenCleared: true as const } : {}),
           };
         }),
         delete: Effect.fn(function* () {
@@ -727,6 +741,7 @@ export const MetricsStreamProvider = () =>
             ...(previous?.tokenDigest
               ? { tokenDigest: previous.tokenDigest }
               : {}),
+            ...(previous?.tokenCleared ? { tokenCleared: true as const } : {}),
           } satisfies MetricsStreamAttributes;
         }).pipe(ignore404);
       return MetricsStream.Provider.of({
@@ -734,14 +749,14 @@ export const MetricsStreamProvider = () =>
         list: () => read().pipe(Effect.map((v) => (v ? [v] : []))),
         read: ({ output }) =>
           read(output).pipe(Effect.map((v) => (!v || output ? v : Unowned(v)))),
-        diff: ({ news, output }) =>
+        diff: ({ olds, news, output }) =>
           Effect.succeed(
             !isResolved(news) || !output
               ? undefined
               : output.provider !== news.provider ||
                   output.url !== news.url ||
                   (news.token === null
-                    ? output.tokenDigest !== undefined
+                    ? olds.token !== null || output.tokenCleared !== true
                     : news.token !== undefined &&
                       output.tokenDigest !== digest(news.token))
                 ? { action: "update" as const }
@@ -764,6 +779,18 @@ export const MetricsStreamProvider = () =>
               },
             }),
           );
+          const tokenDigest =
+            news.token === undefined
+              ? output?.tokenDigest
+              : news.token === null
+                ? undefined
+                : digest(news.token);
+          const tokenCleared =
+            news.token === undefined
+              ? output?.tokenCleared
+              : news.token === null
+                ? true
+                : undefined;
           return {
             id: api.ownerId,
             ownerId: api.ownerId,
@@ -776,11 +803,8 @@ export const MetricsStreamProvider = () =>
                 }
               : {}),
             ...(string(e, "url") ? { url: string(e, "url")! } : {}),
-            ...(news.token
-              ? { tokenDigest: digest(news.token) }
-              : news.token === undefined && output?.tokenDigest
-                ? { tokenDigest: output.tokenDigest }
-                : {}),
+            ...(tokenDigest === undefined ? {} : { tokenDigest }),
+            ...(tokenCleared ? { tokenCleared: true as const } : {}),
           };
         }),
         delete: Effect.fn(function* () {
@@ -859,7 +883,7 @@ export const ServiceNotificationOverrideProvider = () =>
                   },
                 })
                 .pipe(Effect.map(unwrapRows)),
-            { cursor: (row) => row.cursor },
+            { cursor: (row) => row.cursor, pageSize: 100 },
           );
           return rows.flatMap(({ entity }) => {
             const serviceId = string(entity, "serviceId");

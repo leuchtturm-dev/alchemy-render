@@ -151,7 +151,7 @@ const listEnvironments = (api: RenderApiClient) =>
             },
           })
           .pipe(Effect.map(unwrapRows)),
-      { cursor: (row) => row.cursor },
+      { cursor: (row) => row.cursor, pageSize: 100 },
     );
     const nested = yield* Effect.forEach(
       projects,
@@ -172,7 +172,7 @@ const listEnvironments = (api: RenderApiClient) =>
                 },
               })
               .pipe(Effect.map(unwrapRows)),
-          { cursor: (row) => row.cursor },
+          { cursor: (row) => row.cursor, pageSize: 100 },
         ).pipe(
           Effect.map((rows) =>
             rows.map(({ entity }) =>

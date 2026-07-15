@@ -397,6 +397,60 @@ describe("representative resource lifecycles", () => {
     ).rejects.toThrow("without a pagination cursor");
   });
 
+  it("fails closed when a full resource page repeats its cursor", async () => {
+    const fetch = (async () =>
+      json(
+        Array.from({ length: 100 }, (_, index) => ({
+          registryCredential: {
+            id: `rgc-${index}`,
+            name: `registry-${index}`,
+            registry: "DOCKER",
+            username: "user",
+          },
+          cursor: "stale",
+        })),
+      )) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* RegistryCredential.Provider;
+          return yield* provider.list();
+        }).pipe(
+          Effect.provide(
+            RegistryCredentialProvider().pipe(Layer.provide(withApi(fetch))),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("non-advancing pagination cursor");
+  });
+
+  it("fails closed when environment inventory pagination loses its cursor", async () => {
+    const fetch = (async () =>
+      json(
+        Array.from({ length: 100 }, (_, index) => ({
+          project: {
+            id: `prj-${index}`,
+            name: `project-${index}`,
+            environmentIds: [],
+          },
+        })),
+      )) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Environment.Provider;
+          return yield* provider.list();
+        }).pipe(
+          Effect.provide(
+            EnvironmentProvider().pipe(Layer.provide(withApi(fetch))),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("without a pagination cursor");
+  });
+
   it("redacts the one-time webhook signing secret from a create envelope", async () => {
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -598,6 +652,110 @@ describe("representative resource lifecycles", () => {
     });
     expect(result.reconciled.tokenCleared).toBe(true);
     expect(result.converged).toBeUndefined();
+  });
+
+  it("clears unknown owner and metrics stream tokens once", async () => {
+    const methods: string[] = [];
+    const bodies: unknown[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "PUT") bodies.push(await request.json());
+      return request.url.includes("metrics-stream")
+        ? json({ provider: "CUSTOM", url: "https://metrics.example.com" })
+        : json({ endpoint: "https://logs.example.com", preview: "send" });
+    }) as typeof globalThis.fetch;
+
+    const ownerOlds = {
+      endpoint: "https://logs.example.com",
+      preview: "send" as const,
+    };
+    const ownerNews = { ...ownerOlds, token: null };
+    const ownerOutput = { id: "tea-test", ownerId: "tea-test", ...ownerOlds };
+    const ownerResult = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* OwnerLogStream.Provider;
+        const before = yield* provider.diff!(
+          diffInput(ownerOlds, ownerNews, ownerOutput),
+        );
+        const reconciled = yield* provider.reconcile({
+          ...reconcileInput(ownerNews, ownerOutput),
+          olds: ownerOlds,
+        });
+        const refreshed = yield* provider.read!(
+          readInput(ownerNews, reconciled),
+        );
+        const after = yield* provider.diff!(
+          diffInput(ownerNews, ownerNews, refreshed!),
+        );
+        const reacquired = yield* provider.diff!(
+          diffInput(ownerOlds, ownerNews, refreshed!),
+        );
+        return { before, reconciled, refreshed, after, reacquired };
+      }).pipe(
+        Effect.provide(
+          OwnerLogStreamProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    const metricsOlds = {
+      provider: "CUSTOM" as const,
+      url: "https://metrics.example.com",
+    };
+    const metricsNews = { ...metricsOlds, token: null };
+    const metricsOutput = {
+      id: "tea-test",
+      ownerId: "tea-test",
+      ...metricsOlds,
+    };
+    const metricsResult = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* MetricsStream.Provider;
+        const before = yield* provider.diff!(
+          diffInput(metricsOlds, metricsNews, metricsOutput),
+        );
+        const reconciled = yield* provider.reconcile({
+          ...reconcileInput(metricsNews, metricsOutput),
+          olds: metricsOlds,
+        });
+        const refreshed = yield* provider.read!(
+          readInput(metricsNews, reconciled),
+        );
+        const after = yield* provider.diff!(
+          diffInput(metricsNews, metricsNews, refreshed!),
+        );
+        const reacquired = yield* provider.diff!(
+          diffInput(metricsOlds, metricsNews, refreshed!),
+        );
+        return { before, reconciled, refreshed, after, reacquired };
+      }).pipe(
+        Effect.provide(
+          MetricsStreamProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    for (const result of [ownerResult, metricsResult]) {
+      expect(result.before).toEqual({ action: "update" });
+      expect(result.reconciled.tokenCleared).toBe(true);
+      expect(result.refreshed?.tokenCleared).toBe(true);
+      expect(result.after).toBeUndefined();
+      expect(result.reacquired).toEqual({ action: "update" });
+    }
+    expect(methods).toEqual(["PUT", "GET", "PUT", "GET"]);
+    expect(bodies).toEqual([
+      {
+        endpoint: "https://logs.example.com",
+        preview: "send",
+        token: "",
+      },
+      {
+        provider: "CUSTOM",
+        url: "https://metrics.example.com",
+        token: "",
+      },
+    ]);
   });
 
   it("does not claim write-only stream token changes after an indeterminate PUT", async () => {
@@ -2234,7 +2392,10 @@ describe("representative resource lifecycles", () => {
           reconcileInput({
             name: "image-cron",
             runtime: "image" as const,
-            image: { imagePath: "docker.io/acme/job:1" },
+            image: {
+              imagePath: "docker.io/acme/job:1",
+              registryCredentialId: "rgc-2",
+            },
             dockerCommand: "bun run cron",
             schedule: "30 * * * *",
           }),
@@ -2262,6 +2423,7 @@ describe("representative resource lifecycles", () => {
       image: {
         ownerId: "tea-test",
         imagePath: "docker.io/acme/job:1",
+        registryCredentialId: "rgc-2",
       },
       serviceDetails: {
         runtime: "image",
@@ -2269,6 +2431,7 @@ describe("representative resource lifecycles", () => {
           dockerCommand: "bun run cron",
           dockerContext: "",
           dockerfilePath: "",
+          registryCredential: { id: "rgc-2" },
         },
       },
     });

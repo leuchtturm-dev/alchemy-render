@@ -45,12 +45,14 @@ export type DeployProps = DeployTargetProps | DeployModeProps;
 export interface RollbackProps extends ServiceProps {
   readonly deployId: string;
 }
+/** Cancel a deploy. Render does not support cron-job deploy cancellation. */
 export interface CancelDeployProps extends ServiceProps {
   readonly deployId: string;
 }
 export interface PurgeCacheProps extends ServiceProps {}
 export interface SuspendServiceProps extends ServiceProps {}
 export interface ResumeServiceProps extends ServiceProps {}
+/** Restart a service. Render does not support restarting cron jobs. */
 export interface RestartServiceProps extends ServiceProps {}
 export interface ScaleServiceProps extends ServiceProps {
   readonly numInstances: number;

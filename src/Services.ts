@@ -320,6 +320,13 @@ const cronCreateEnvSpecificDetails = (props: ServiceSourceProps) => {
       dockerCommand: props.dockerCommand ?? "",
       dockerContext: "",
       dockerfilePath: "",
+      ...(props.image.registryCredentialId === undefined
+        ? {}
+        : {
+            registryCredential: {
+              id: props.image.registryCredentialId,
+            },
+          }),
     };
   }
   return envSpecificDetails(props);
@@ -423,6 +430,20 @@ const readEnvironmentDigest = (
         }
       }
       const next = rows.at(-1)?.cursor;
+      if (!next && rows.length >= 100) {
+        return yield* Effect.fail(
+          new RenderApiError(
+            "Render list response reached the requested limit without a pagination cursor",
+          ),
+        );
+      }
+      if (next === cursor && rows.length >= 100) {
+        return yield* Effect.fail(
+          new RenderApiError(
+            "Render list response reached the requested limit with a non-advancing pagination cursor",
+          ),
+        );
+      }
       if (!next || next === cursor || rows.length === 0) break;
       cursor = next;
     }

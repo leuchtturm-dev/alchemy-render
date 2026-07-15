@@ -188,9 +188,9 @@ const attrs = (
     ...(fallback.previous?.datadogApiKeyDigest
       ? { datadogApiKeyDigest: fallback.previous.datadogApiKeyDigest }
       : {}),
-    ...(fallback.previous?.datadogSite
-      ? { datadogSite: fallback.previous.datadogSite }
-      : {}),
+    ...(fallback.previous?.datadogSite === undefined
+      ? {}
+      : { datadogSite: fallback.previous.datadogSite }),
   };
 };
 
@@ -471,7 +471,9 @@ export const PostgresProvider = () =>
         ...(props.datadogApiKey
           ? { datadogApiKeyDigest: digest(props.datadogApiKey) }
           : {}),
-        ...(props.datadogSite ? { datadogSite: props.datadogSite } : {}),
+        ...(props.datadogSite === undefined
+          ? {}
+          : { datadogSite: props.datadogSite }),
       };
     },
     finalize: (attributes, props, api, phase) =>
