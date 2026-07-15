@@ -29,6 +29,12 @@ import {
 } from "../src/Datastores.js";
 import { fromApiKey } from "../src/Credentials.js";
 import {
+  EnvironmentGroupEnvVar,
+  EnvironmentGroupEnvVarProvider,
+  EnvironmentGroupSecretFile,
+  EnvironmentGroupSecretFileProvider,
+} from "../src/EnvironmentGroups.js";
+import {
   Environment,
   EnvironmentProvider,
   EnvironmentResource,
@@ -39,6 +45,8 @@ import {
 import {
   BackgroundWorker,
   BackgroundWorkerProvider,
+  CronJob,
+  CronJobProvider,
   PrivateService,
   PrivateServiceProvider,
   WebService,
@@ -49,12 +57,17 @@ import {
   AutoscalingProvider,
   CustomDomain,
   CustomDomainProvider,
+  Header,
+  HeaderProvider,
   Disk,
   DiskProvider,
   Route,
+  type RouteAttributes,
   RouteProvider,
   ServiceEnvVar,
   ServiceEnvVarProvider,
+  ServiceSecretFile,
+  ServiceSecretFileProvider,
 } from "../src/ServiceConfiguration.js";
 
 const runPromise = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -88,6 +101,14 @@ const reconcileInput = <P, A>(news: P, output?: A) => ({
   output,
   bindings: [],
   session,
+});
+
+const readInput = <P, A>(olds: P, output?: A) => ({
+  id: "Test",
+  fqn: "Test",
+  instanceId: "00112233445566778899aabbccddeeff",
+  olds,
+  output,
 });
 
 const diffInput = <P, A>(olds: P, news: P, output: A) => ({
@@ -175,7 +196,7 @@ describe("representative resource lifecycles", () => {
       ),
     );
 
-    expect(methods).toEqual(["GET", "POST", "GET"]);
+    expect(methods).toEqual(["POST", "GET"]);
     expect(result.created.serviceId).toBe("srv-1");
     expect(result.created.deployId).toBe("dep-1");
     expect(result.created.url).toBe("https://api.onrender.com");
@@ -351,6 +372,31 @@ describe("representative resource lifecycles", () => {
     expect(JSON.stringify(result)).not.toContain("registry-secret");
   });
 
+  it("fails closed when a full list page omits Render's pagination cursor", async () => {
+    const fetch = (async () =>
+      json(
+        Array.from({ length: 100 }, (_, index) => ({
+          id: `rgc-${index}`,
+          name: `registry-${index}`,
+          registry: "DOCKER",
+          username: "user",
+        })),
+      )) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* RegistryCredential.Provider;
+          return yield* provider.list();
+        }).pipe(
+          Effect.provide(
+            RegistryCredentialProvider().pipe(Layer.provide(withApi(fetch))),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("without a pagination cursor");
+  });
+
   it("redacts the one-time webhook signing secret from a create envelope", async () => {
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
@@ -498,6 +544,99 @@ describe("representative resource lifecycles", () => {
     expect(clearDiff).toEqual({ action: "update" });
   });
 
+  it("clears an unknown resource log token once and records the managed clear", async () => {
+    const methods: string[] = [];
+    let putBody: unknown;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "PUT") putBody = await request.json();
+      return json({
+        resourceId: "srv-1",
+        endpoint: "https://logs.example.com",
+        setting: "send",
+      });
+    }) as typeof globalThis.fetch;
+    const olds = {
+      resourceId: "srv-1",
+      endpoint: "https://logs.example.com",
+      setting: "send" as const,
+    };
+    const news = { ...olds, token: null };
+    const output = {
+      id: "srv-1",
+      resourceId: "srv-1",
+      endpoint: "https://logs.example.com",
+      setting: "send" as const,
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ResourceLogStream.Provider;
+        const diff = yield* provider.diff!(diffInput(olds, news, output));
+        const reconciled = yield* provider.reconcile({
+          ...reconcileInput(news, output),
+          olds,
+        });
+        const converged = yield* provider.diff!(
+          diffInput(news, news, reconciled),
+        );
+        return { diff, reconciled, converged };
+      }).pipe(
+        Effect.provide(
+          ResourceLogStreamProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(result.diff).toEqual({ action: "update" });
+    expect(methods).toEqual(["GET", "PUT", "GET"]);
+    expect(putBody).toEqual({
+      endpoint: "https://logs.example.com",
+      setting: "send",
+      token: "",
+    });
+    expect(result.reconciled.tokenCleared).toBe(true);
+    expect(result.converged).toBeUndefined();
+  });
+
+  it("does not claim write-only stream token changes after an indeterminate PUT", async () => {
+    const methods: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      methods.push(request.method);
+      if (request.method === "PUT") {
+        return json({ message: "indeterminate" }, 500);
+      }
+      return json({
+        resourceId: "srv-1",
+        endpoint: "https://logs.example.com",
+        setting: "send",
+      });
+    }) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* ResourceLogStream.Provider;
+          return yield* provider.reconcile(
+            reconcileInput({
+              resourceId: "srv-1",
+              endpoint: "https://logs.example.com",
+              setting: "send" as const,
+              token: null,
+            }),
+          );
+        }).pipe(
+          Effect.provide(
+            ResourceLogStreamProvider().pipe(Layer.provide(withApi(fetch))),
+          ),
+        ),
+      ),
+    ).rejects.toThrow("Render API returned 500");
+    expect(methods).toEqual(["PUT"]);
+  });
+
   it("resets a service notification override on delete", async () => {
     let body: unknown;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -587,7 +726,11 @@ describe("representative resource lifecycles", () => {
       Effect.gen(function* () {
         const provider = yield* WebService.Provider;
         const listed = yield* provider.list();
-        const reconciled = yield* provider.reconcile(reconcileInput(props));
+        const discovered = yield* provider.read!(readInput(props));
+        if (!discovered) throw new Error("expected service discovery");
+        const reconciled = yield* provider.reconcile(
+          reconcileInput(props, { ...discovered }),
+        );
         return { listed, reconciled };
       }).pipe(
         Effect.provide(
@@ -636,7 +779,11 @@ describe("representative resource lifecycles", () => {
       Effect.gen(function* () {
         const provider = yield* Environment.Provider;
         const listed = yield* provider.list();
-        const reconciled = yield* provider.reconcile(reconcileInput(props));
+        const discovered = yield* provider.read!(readInput(props));
+        if (!discovered) throw new Error("expected environment discovery");
+        const reconciled = yield* provider.reconcile(
+          reconcileInput(props, { ...discovered }),
+        );
         return { listed, reconciled };
       }).pipe(
         Effect.provide(
@@ -665,7 +812,13 @@ describe("representative resource lifecycles", () => {
       type: "rewrite" as const,
     };
     const news = { ...olds, source: "/new" };
-    const output = { id: "route-1", serviceId: "srv-1" };
+    const output = {
+      id: "route-1",
+      serviceId: "srv-1",
+      source: olds.source,
+      destination: olds.destination,
+      type: olds.type,
+    };
     const diff = await runPromise(
       Effect.gen(function* () {
         const provider = yield* Route.Provider;
@@ -681,6 +834,84 @@ describe("representative resource lifecycles", () => {
       ),
     );
     expect(diff).toEqual({ action: "replace" });
+  });
+
+  it("refreshes legacy route outputs before deciding whether to replace", async () => {
+    let reads = 0;
+    const props = {
+      serviceId: "srv-1",
+      source: "/api/*",
+      destination: "/index.html",
+      type: "rewrite" as const,
+    };
+    const legacyOutput = {
+      id: "route-1",
+      serviceId: "srv-1",
+    } as RouteAttributes;
+    const fetch = (async () => {
+      reads++;
+      return json([{ id: "route-1", priority: 0, ...props }]);
+    }) as typeof globalThis.fetch;
+
+    const diff = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Route.Provider;
+        return yield* provider.diff!(
+          diffInput(props, props, legacyOutput),
+        );
+      }).pipe(
+        Effect.provide(
+          RouteProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(diff).toBeUndefined();
+    expect(reads).toBe(1);
+  });
+
+  it("updates route priority through Render's only route PATCH field", async () => {
+    let patchBody: unknown;
+    const route = {
+      id: "route-1",
+      serviceId: "srv-1",
+      source: "/api/*",
+      destination: "/index.html",
+      type: "rewrite" as const,
+      priority: 1,
+    };
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      if (request.method === "GET") return json([route]);
+      patchBody = await request.json();
+      return json({ ...route, priority: 2 });
+    }) as typeof globalThis.fetch;
+    const olds = {
+      serviceId: "srv-1",
+      source: route.source,
+      destination: route.destination,
+      type: route.type,
+      priority: 1,
+    };
+    const news = { ...olds, priority: 2 };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* Route.Provider;
+        const diff = yield* provider.diff!(diffInput(olds, news, route));
+        const reconciled = yield* provider.reconcile({
+          ...reconcileInput(news, route),
+          olds,
+        });
+        return { diff, reconciled };
+      }).pipe(
+        Effect.provide(RouteProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    expect(result.diff).toEqual({ action: "update" });
+    expect(patchBody).toEqual({ priority: 2 });
+    expect(result.reconciled.priority).toBe(2);
   });
 
   it("replaces a cold-adopted resource when observed immutable state differs", async () => {
@@ -730,15 +961,106 @@ describe("representative resource lifecycles", () => {
     const result = await runPromise(
       Effect.gen(function* () {
         const provider = yield* ServiceEnvVar.Provider;
-        return yield* provider.reconcile(reconcileInput(props));
+        const discovered = yield* provider.read!(readInput(props));
+        if (!discovered) throw new Error("expected variable discovery");
+        return yield* provider.reconcile(
+          reconcileInput(props, { ...discovered }),
+        );
       }).pipe(
         Effect.provide(
           ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
         ),
       ),
     );
-    expect(methods).toEqual(["GET"]);
+    expect(methods).toEqual(["GET", "GET"]);
     expect(result.generated).toBe(true);
+  });
+
+  it("does not let generated-value adoption shortcuts suppress a requested rotation", async () => {
+    const requests: Array<{ method: string; body?: unknown }> = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      requests.push({
+        method: request.method,
+        ...(request.method === "PUT" ? { body: await request.json() } : {}),
+      });
+      if (request.method === "GET") {
+        return json({ key: "TOKEN", value: "old-value" });
+      }
+      if (request.method === "PUT") {
+        return json({ key: "TOKEN", value: "new-generated-value" });
+      }
+      return json({ id: "dep-1", status: "created" }, 201);
+    }) as typeof globalThis.fetch;
+    const olds = {
+      serviceId: "srv-1",
+      key: "TOKEN",
+      value: Redacted.make("old-value"),
+    };
+    const news = {
+      serviceId: "srv-1",
+      key: "TOKEN",
+      generateValue: true as const,
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceEnvVar.Provider;
+        return yield* provider.reconcile({
+          ...reconcileInput(news, {
+            id: "TOKEN",
+            name: "TOKEN",
+            generated: false,
+            valueDigest: "old-digest",
+          }),
+          olds,
+        });
+      }).pipe(
+        Effect.provide(
+          ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(requests).toEqual([
+      { method: "GET" },
+      { method: "PUT", body: { generateValue: true } },
+      { method: "POST" },
+    ]);
+    expect(result.generated).toBe(true);
+    expect(result.valueDigest).toBeUndefined();
+  });
+
+  it("creates generated environment-group variables without persisting their value", async () => {
+    let body: unknown;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      body = await request.json();
+      return json({ key: "TOKEN", value: "generated-secret" });
+    }) as typeof globalThis.fetch;
+    const props = {
+      environmentGroupId: "evg-1",
+      key: "TOKEN",
+      generateValue: true as const,
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* EnvironmentGroupEnvVar.Provider;
+        return yield* provider.reconcile(reconcileInput(props));
+      }).pipe(
+        Effect.provide(
+          EnvironmentGroupEnvVarProvider().pipe(
+            Layer.provide(withApi(fetch)),
+          ),
+        ),
+      ),
+    );
+
+    expect(body).toEqual({ generateValue: true });
+    expect(result.generated).toBe(true);
+    expect(result.valueDigest).toBeUndefined();
+    expect(JSON.stringify(result)).not.toContain("generated-secret");
   });
 
   it("normalizes omitted autoscaling criteria to Render's complete shape", async () => {
@@ -832,7 +1154,6 @@ describe("representative resource lifecycles", () => {
       ),
     );
     expect(paths).toEqual([
-      "GET /v1/key-value",
       "POST /v1/key-value",
       "GET /v1/key-value/kv-1",
       "GET /v1/key-value/kv-1/connection-info",
@@ -995,7 +1316,10 @@ describe("representative resource lifecycles", () => {
       },
       runCommand: "bun run workflow",
       region: "oregon" as const,
-      envVars: [{ key: "TOKEN", value: Redacted.make("first") }],
+      envVars: [
+        { key: "TOKEN", value: Redacted.make("first") },
+        { key: "GENERATED", generateValue: true as const },
+      ],
     };
     const result = await runPromise(
       Effect.gen(function* () {
@@ -1006,7 +1330,10 @@ describe("representative resource lifecycles", () => {
             props,
             {
               ...props,
-              envVars: [{ key: "TOKEN", value: Redacted.make("second") }],
+              envVars: [
+                { key: "TOKEN", value: Redacted.make("second") },
+                { key: "GENERATED", generateValue: true as const },
+              ],
             },
             created,
           ),
@@ -1016,7 +1343,10 @@ describe("representative resource lifecycles", () => {
         Effect.provide(WorkflowProvider().pipe(Layer.provide(withApi(fetch)))),
       ),
     );
-    expect(body?.envVars).toEqual([{ key: "TOKEN", value: "first" }]);
+    expect(body?.envVars).toEqual([
+      { key: "TOKEN", value: "first" },
+      { key: "GENERATED", generateValue: true },
+    ]);
     expect(result.created.envVarsDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(result.created)).not.toContain("first");
     expect(result.changed).toEqual({ action: "replace" });
@@ -1166,7 +1496,7 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     );
-    expect(methods).toEqual(["GET", "POST", "PATCH", "POST"]);
+    expect(methods).toEqual(["POST", "PATCH", "POST"]);
     expect(bodies[1]).toEqual({
       serviceDetails: { cache: { profile: "origin-controlled" } },
     });
@@ -1192,7 +1522,7 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     );
-    expect(methods).toEqual(["GET", "POST"]);
+    expect(methods).toEqual(["POST"]);
     expect(result.id).toBe("cd-1");
   });
 
@@ -1460,18 +1790,14 @@ describe("representative resource lifecycles", () => {
     expect(methods).toEqual(["GET"]);
   });
 
-  it("recovers an accepted environment write and still deploys it", async () => {
+  it("recovers a verifiably accepted environment PUT and still deploys it", async () => {
     const requests: string[] = [];
-    let reads = 0;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const request = new Request(input, init);
       const path = new URL(request.url).pathname;
       requests.push(`${request.method} ${path}`);
       if (request.method === "GET") {
-        reads += 1;
-        return reads === 1
-          ? json({ message: "missing" }, 404)
-          : json({ key: "TOKEN" });
+        return json({ key: "TOKEN", value: "secret" });
       }
       if (request.method === "PUT") {
         return json({ message: "indeterminate write" }, 500);
@@ -1497,7 +1823,6 @@ describe("representative resource lifecycles", () => {
 
     expect(result.valueDigest).toHaveLength(64);
     expect(requests).toEqual([
-      "GET /v1/services/srv-1/env-vars/TOKEN",
       "PUT /v1/services/srv-1/env-vars/TOKEN",
       "GET /v1/services/srv-1/env-vars/TOKEN",
       "POST /v1/services/srv-1/deploys",
@@ -1541,7 +1866,6 @@ describe("representative resource lifecycles", () => {
       ),
     );
     expect(requests).toEqual([
-      "GET /v1/services/srv-1/env-vars/TOKEN",
       "PUT /v1/services/srv-1/env-vars/TOKEN",
       "POST /v1/services/srv-1/deploys",
       "DELETE /v1/services/srv-1/env-vars/TOKEN",
@@ -1567,10 +1891,10 @@ describe("representative resource lifecycles", () => {
         ),
       ),
     ).rejects.toThrow("Render API returned 400");
-    expect(methods).toEqual(["GET", "POST"]);
+    expect(methods).toEqual(["POST"]);
   });
 
-  it("recovers an indeterminate create without PATCHing the observed object", async () => {
+  it("surfaces an indeterminate POST create without claiming a same-name object", async () => {
     const methods: string[] = [];
     let created = false;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -1584,16 +1908,438 @@ describe("representative resource lifecycles", () => {
         ? json([{ project: { id: "prj-1", name: "app" } }])
         : json([]);
     }) as typeof globalThis.fetch;
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Project.Provider;
+          return yield* provider.reconcile(reconcileInput({ name: "app" }));
+        }).pipe(
+          Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Render API request failed");
+    expect(methods).toEqual(["POST"]);
+  });
+
+  it("never rebinds a missing owned ID to an unrelated same-name resource", async () => {
+    const requests: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      requests.push(`${request.method} ${path}`);
+      if (request.method === "GET" && path.endsWith("/prj-owned")) {
+        return json({ message: "missing" }, 404);
+      }
+      if (request.method === "GET") {
+        return json([{ project: { id: "prj-foreign", name: "app" } }]);
+      }
+      if (request.method === "POST") {
+        return json({ message: "name already exists" }, 409);
+      }
+      return json({ id: "prj-foreign", name: "app" });
+    }) as typeof globalThis.fetch;
+
+    await expect(
+      runPromise(
+        Effect.gen(function* () {
+          const provider = yield* Project.Provider;
+          return yield* provider.reconcile(
+            reconcileInput(
+              { name: "app" },
+              {
+                id: "prj-owned",
+                projectId: "prj-owned",
+                name: "app",
+                environmentIds: [],
+              },
+            ),
+          );
+        }).pipe(
+          Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+        ),
+      ),
+    ).rejects.toThrow("Render API returned 409");
+    expect(requests).toEqual([
+      "GET /v1/projects/prj-owned",
+      "POST /v1/projects",
+    ]);
+  });
+
+  it("uses only endpoint-supported filters and strict IDs for header and route reads", async () => {
+    const urls: string[] = [];
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const url = new URL(request.url);
+      urls.push(url.href);
+      return url.pathname.endsWith("/headers")
+        ? json([
+            {
+              header: {
+                id: "hdr-foreign",
+                name: "X-Frame-Options",
+                path: "/*",
+                value: "SAMEORIGIN",
+              },
+            },
+          ])
+        : json([
+            {
+              route: {
+                id: "rte-1",
+                type: "rewrite",
+                source: "/api/*",
+                destination: "/old.html",
+              },
+            },
+          ]);
+    }) as typeof globalThis.fetch;
+    const headerProps = {
+      serviceId: "srv-1",
+      name: "X-Frame-Options",
+      path: "/*",
+      value: "DENY",
+    };
+    const routeProps = {
+      serviceId: "srv-1",
+      type: "rewrite" as const,
+      source: "/api/*",
+      destination: "/index.html",
+    };
+
     const result = await runPromise(
       Effect.gen(function* () {
-        const provider = yield* Project.Provider;
-        return yield* provider.reconcile(reconcileInput({ name: "app" }));
+        const header = yield* Header.Provider;
+        const coldHeader = yield* header.read!(readInput(headerProps));
+        const missingOwnedHeader = yield* header.read!(
+          readInput(headerProps, {
+            id: "hdr-owned",
+            serviceId: "srv-1",
+            name: "X-Frame-Options",
+          }),
+        );
+        const route = yield* Route.Provider;
+        const coldRoute = yield* route.read!(readInput(routeProps));
+        const missingOwnedRoute = yield* route.read!(
+          readInput(routeProps, {
+            id: "rte-owned",
+            serviceId: "srv-1",
+            source: routeProps.source,
+            destination: routeProps.destination,
+            type: routeProps.type,
+          }),
+        );
+        return {
+          coldHeader,
+          missingOwnedHeader,
+          coldRoute,
+          missingOwnedRoute,
+        };
       }).pipe(
-        Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
+        Effect.provide(
+          Layer.mergeAll(HeaderProvider(), RouteProvider()).pipe(
+            Layer.provide(withApi(fetch)),
+          ),
+        ),
       ),
     );
-    expect(result.projectId).toBe("prj-1");
-    expect(methods).toEqual(["GET", "POST", "GET"]);
+
+    expect(result.coldHeader?.id).toBe("hdr-foreign");
+    expect(result.missingOwnedHeader).toBeUndefined();
+    expect(result.coldRoute?.id).toBe("rte-1");
+    expect(result.missingOwnedRoute).toBeUndefined();
+    const headerQuery = new URL(urls[0]!).searchParams;
+    expect(headerQuery.get("name")).toBe("X-Frame-Options");
+    expect(headerQuery.get("path")).toBe("/*");
+    expect(headerQuery.has("value")).toBe(false);
+    expect(headerQuery.has("ownerId")).toBe(false);
+    const strictHeaderQuery = new URL(urls[1]!).searchParams;
+    expect(strictHeaderQuery.has("name")).toBe(false);
+    expect(strictHeaderQuery.has("path")).toBe(false);
+    expect(strictHeaderQuery.has("value")).toBe(false);
+    const routeQuery = new URL(urls[2]!).searchParams;
+    expect(routeQuery.get("type")).toBe("rewrite");
+    expect(routeQuery.get("source")).toBe("/api/*");
+    expect(routeQuery.has("destination")).toBe(false);
+    expect(routeQuery.has("ownerId")).toBe(false);
+    expect(routeQuery.has("name")).toBe(false);
+    const strictRouteQuery = new URL(urls[3]!).searchParams;
+    expect(strictRouteQuery.has("type")).toBe(false);
+    expect(strictRouteQuery.has("source")).toBe(false);
+    expect(strictRouteQuery.has("destination")).toBe(false);
+  });
+
+  it("hashes remotely readable secret drift without persisting plaintext", async () => {
+    const remoteValue = "rotated-out-of-band";
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(new Request(input, init).url).pathname;
+      return path.includes("secret-files")
+        ? json({ name: "SECRET", content: remoteValue })
+        : json({ key: "TOKEN", value: remoteValue });
+    }) as typeof globalThis.fetch;
+    const serviceEnvProps = {
+      serviceId: "srv-1",
+      key: "TOKEN",
+      value: Redacted.make("desired"),
+    };
+    const serviceFileProps = {
+      serviceId: "srv-1",
+      name: "SECRET",
+      content: Redacted.make("desired"),
+    };
+    const groupEnvProps = {
+      environmentGroupId: "evg-1",
+      key: "TOKEN",
+      value: Redacted.make("desired"),
+    };
+    const groupFileProps = {
+      environmentGroupId: "evg-1",
+      name: "SECRET",
+      content: Redacted.make("desired"),
+    };
+
+    const serviceEnv = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceEnvVar.Provider;
+        const observed = yield* provider.read!(
+          readInput(serviceEnvProps, {
+            id: "TOKEN",
+            name: "TOKEN",
+            generated: false,
+            valueDigest: "stale",
+          }),
+        );
+        if (!observed) throw new Error("expected service env var");
+        const diff = yield* provider.diff!(
+          diffInput(serviceEnvProps, serviceEnvProps, observed),
+        );
+        return { observed, diff };
+      }).pipe(
+        Effect.provide(
+          ServiceEnvVarProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+    const serviceFile = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* ServiceSecretFile.Provider;
+        const observed = yield* provider.read!(
+          readInput(serviceFileProps, {
+            id: "SECRET",
+            name: "SECRET",
+            generated: false,
+            valueDigest: "stale",
+          }),
+        );
+        if (!observed) throw new Error("expected service secret file");
+        const diff = yield* provider.diff!(
+          diffInput(serviceFileProps, serviceFileProps, observed),
+        );
+        return { observed, diff };
+      }).pipe(
+        Effect.provide(
+          ServiceSecretFileProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+    const groupEnv = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* EnvironmentGroupEnvVar.Provider;
+        const observed = yield* provider.read!(
+          readInput(groupEnvProps, {
+            id: "TOKEN",
+            name: "TOKEN",
+            valueDigest: "stale",
+          }),
+        );
+        if (!observed) throw new Error("expected group env var");
+        const diff = yield* provider.diff!(
+          diffInput(groupEnvProps, groupEnvProps, observed),
+        );
+        return { observed, diff };
+      }).pipe(
+        Effect.provide(
+          EnvironmentGroupEnvVarProvider().pipe(
+            Layer.provide(withApi(fetch)),
+          ),
+        ),
+      ),
+    );
+    const groupFile = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* EnvironmentGroupSecretFile.Provider;
+        const observed = yield* provider.read!(
+          readInput(groupFileProps, {
+            id: "SECRET",
+            name: "SECRET",
+            valueDigest: "stale",
+          }),
+        );
+        if (!observed) throw new Error("expected group secret file");
+        const diff = yield* provider.diff!(
+          diffInput(groupFileProps, groupFileProps, observed),
+        );
+        return { observed, diff };
+      }).pipe(
+        Effect.provide(
+          EnvironmentGroupSecretFileProvider().pipe(
+            Layer.provide(withApi(fetch)),
+          ),
+        ),
+      ),
+    );
+
+    for (const result of [serviceEnv, serviceFile, groupEnv, groupFile]) {
+      expect(result.observed.valueDigest).toHaveLength(64);
+      expect(result.diff).toEqual({ action: "update" });
+      expect(JSON.stringify(result.observed)).not.toContain(remoteValue);
+    }
+  });
+
+  it("uses Render's cron-specific Docker details for Docker and image creates", async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    let sequence = 0;
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const body = (await request.json()) as Record<string, unknown>;
+      bodies.push(body);
+      sequence += 1;
+      return json(
+        {
+          service: {
+            id: `crn-${sequence}`,
+            name: `cron-${sequence}`,
+            ownerId: "tea-test",
+            type: "cron_job",
+            serviceDetails: body.serviceDetails,
+          },
+          deployId: `dep-${sequence}`,
+        },
+        201,
+      );
+    }) as typeof globalThis.fetch;
+
+    await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* CronJob.Provider;
+        yield* provider.reconcile(
+          reconcileInput({
+            name: "docker-cron",
+            runtime: "docker" as const,
+            repo: "https://github.com/acme/jobs",
+            registryCredentialId: "rgc-1",
+            schedule: "0 * * * *",
+          }),
+        );
+        yield* provider.reconcile(
+          reconcileInput({
+            name: "image-cron",
+            runtime: "image" as const,
+            image: { imagePath: "docker.io/acme/job:1" },
+            dockerCommand: "bun run cron",
+            schedule: "30 * * * *",
+          }),
+        );
+      }).pipe(
+        Effect.provide(CronJobProvider().pipe(Layer.provide(withApi(fetch)))),
+      ),
+    );
+
+    expect(bodies[0]).toMatchObject({
+      serviceDetails: {
+        runtime: "docker",
+        envSpecificDetails: {
+          dockerCommand: "",
+          dockerContext: "",
+          dockerfilePath: "",
+          registryCredential: { id: "rgc-1" },
+        },
+      },
+    });
+    expect(bodies[0]).not.toHaveProperty(
+      "serviceDetails.envSpecificDetails.registryCredentialId",
+    );
+    expect(bodies[1]).toMatchObject({
+      image: {
+        ownerId: "tea-test",
+        imagePath: "docker.io/acme/job:1",
+      },
+      serviceDetails: {
+        runtime: "image",
+        envSpecificDetails: {
+          dockerCommand: "bun run cron",
+          dockerContext: "",
+          dockerfilePath: "",
+        },
+      },
+    });
+  });
+
+  it("releases an omitted service branch without a false PATCH or deploy", async () => {
+    const methods: string[] = [];
+    const service = {
+      id: "srv-1",
+      name: "api",
+      ownerId: "tea-test",
+      type: "web_service",
+      repo: "https://github.com/acme/app",
+      branch: "main",
+      autoDeploy: "yes",
+      serviceDetails: {
+        runtime: "node",
+        plan: "starter",
+        envSpecificDetails: {
+          buildCommand: "bun install",
+          startCommand: "bun start",
+        },
+      },
+    };
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      methods.push(`${request.method} ${path}`);
+      if (request.method === "GET") return json(service);
+      if (request.method === "POST" && path.endsWith("/services")) {
+        return json({ service, deployId: "dep-create" }, 201);
+      }
+      return json({ message: "unexpected write" }, 500);
+    }) as typeof globalThis.fetch;
+    const olds = {
+      name: "api",
+      repo: "https://github.com/acme/app",
+      branch: "main",
+      runtime: "node" as const,
+      buildCommand: "bun install",
+      startCommand: "bun start",
+      plan: "starter" as const,
+    };
+    const news = {
+      name: "api",
+      repo: "https://github.com/acme/app",
+      runtime: "node" as const,
+      buildCommand: "bun install",
+      startCommand: "bun start",
+      plan: "starter" as const,
+    };
+
+    const result = await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* WebService.Provider;
+        const created = yield* provider.reconcile(reconcileInput(olds));
+        methods.length = 0;
+        const reconciled = yield* provider.reconcile({
+          ...reconcileInput(news, created),
+          olds,
+        });
+        return { created, reconciled };
+      }).pipe(
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(methods).toEqual(["GET /v1/services/srv-1"]);
+    expect(result.reconciled.coreDigest).not.toBe(result.created.coreDigest);
   });
 
   it("rejects ambiguous cold lookups instead of adopting the first match", async () => {
@@ -1606,7 +2352,9 @@ describe("representative resource lifecycles", () => {
       runPromise(
         Effect.gen(function* () {
           const provider = yield* Project.Provider;
-          return yield* provider.reconcile(reconcileInput({ name: "app" }));
+          return yield* provider.read!(
+            readInput<{ name: string }, never>({ name: "app" }),
+          );
         }).pipe(
           Effect.provide(ProjectProvider().pipe(Layer.provide(withApi(fetch)))),
         ),

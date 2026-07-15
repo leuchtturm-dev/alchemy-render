@@ -62,7 +62,7 @@ export interface WebhookAttributes extends CommonAttributes {
   readonly webhookId: string;
   readonly url?: string;
   readonly enabled?: boolean;
-  readonly eventFilter?: readonly string[];
+  readonly eventFilter?: readonly WebhookEvent[];
   readonly signingSecret?: Redacted.Redacted<string>;
 }
 export interface LogStreamProps {
@@ -77,18 +77,30 @@ export interface OwnerLogStreamAttributes extends CommonAttributes {
   readonly preview?: "send" | "drop";
   readonly tokenDigest?: string;
 }
-export interface ResourceLogStreamProps {
+interface ResourceLogStreamBaseProps {
   readonly resourceId: string;
-  readonly endpoint?: string;
   /** Set null to clear a configured token. */
   readonly token?: Redacted.Redacted<string> | null;
-  readonly setting: "send" | "drop";
 }
+
+export type ResourceLogStreamProps = ResourceLogStreamBaseProps &
+  (
+    | {
+        readonly setting: "send";
+        readonly endpoint: string;
+      }
+    | {
+        readonly setting: "drop";
+        readonly endpoint?: never;
+      }
+  );
 export interface ResourceLogStreamAttributes extends CommonAttributes {
   readonly resourceId: string;
   readonly endpoint?: string;
   readonly setting?: "send" | "drop";
   readonly tokenDigest?: string;
+  /** Equality marker distinguishing a managed clear from an unknown token. */
+  readonly tokenCleared?: true;
 }
 export interface MetricsStreamProps {
   readonly provider:
@@ -129,16 +141,25 @@ export interface WorkflowBuildConfig {
   readonly rootDir?: string;
   readonly runtime: "elixir" | "go" | "node" | "python" | "ruby";
 }
+export type WorkflowEnvVar =
+  | {
+      readonly key: string;
+      readonly value: Redacted.Redacted<string>;
+      readonly generateValue?: never;
+    }
+  | {
+      readonly key: string;
+      readonly value?: never;
+      readonly generateValue: true;
+    };
+
 export interface WorkflowProps {
   readonly name?: string;
   readonly buildConfig: WorkflowBuildConfig;
   readonly runCommand: string;
   readonly region: "frankfurt" | "oregon" | "ohio" | "singapore" | "virginia";
   readonly autoDeployTrigger?: "commit" | "off" | "checksPass";
-  readonly envVars?: readonly {
-    readonly key: string;
-    readonly value: Redacted.Redacted<string>;
-  }[];
+  readonly envVars?: readonly WorkflowEnvVar[];
 }
 export interface WorkflowAttributes extends CommonAttributes {
   readonly workflowId: string;
@@ -153,12 +174,14 @@ type Managed<
   P extends object,
   A extends object,
 > = Resource.Resource<T, P, A, never, Providers>;
+/** A workspace- or environment-scoped dedicated egress IP. @resource */
 export type DedicatedIp = Managed<
   "Render.DedicatedIp",
   DedicatedIpProps,
   DedicatedIpAttributes
 >;
 export const DedicatedIp = Resource.Resource<DedicatedIp>("Render.DedicatedIp");
+/** Credentials for pulling private container images. The token is stored only as a digest. @resource */
 export type RegistryCredential = Managed<
   "Render.RegistryCredential",
   RegistryCredentialProps,
@@ -167,12 +190,14 @@ export type RegistryCredential = Managed<
 export const RegistryCredential = Resource.Resource<RegistryCredential>(
   "Render.RegistryCredential",
 );
+/** A workspace webhook. The one-time signing secret is returned as Redacted. @resource */
 export type Webhook = Managed<
   "Render.Webhook",
   WebhookProps,
   WebhookAttributes
 >;
 export const Webhook = Resource.Resource<Webhook>("Render.Webhook");
+/** Workspace-wide log streaming settings. @resource */
 export type OwnerLogStream = Managed<
   "Render.OwnerLogStream",
   LogStreamProps,
@@ -181,6 +206,7 @@ export type OwnerLogStream = Managed<
 export const OwnerLogStream = Resource.Resource<OwnerLogStream>(
   "Render.OwnerLogStream",
 );
+/** Per-resource log streaming override. @resource */
 export type ResourceLogStream = Managed<
   "Render.ResourceLogStream",
   ResourceLogStreamProps,
@@ -189,6 +215,7 @@ export type ResourceLogStream = Managed<
 export const ResourceLogStream = Resource.Resource<ResourceLogStream>(
   "Render.ResourceLogStream",
 );
+/** Workspace metrics streaming settings. @resource */
 export type MetricsStream = Managed<
   "Render.MetricsStream",
   MetricsStreamProps,
@@ -197,6 +224,7 @@ export type MetricsStream = Managed<
 export const MetricsStream = Resource.Resource<MetricsStream>(
   "Render.MetricsStream",
 );
+/** A Render workflow definition. Environment changes replace the workflow. @resource */
 export type Workflow = Managed<
   "Render.Workflow",
   WorkflowProps,
@@ -376,7 +404,7 @@ const webhookAttrs = (
       ? {
           eventFilter: e.eventFilter.filter(
             (v): v is string => typeof v === "string",
-          ),
+          ) as WebhookEvent[],
         }
       : {}),
     ...(signingSecret ? { signingSecret } : {}),
@@ -416,6 +444,7 @@ const resourceLogAttrs = (
     ? { setting: string(e, "setting") as "send" | "drop" }
     : {}),
   ...(f.previous?.tokenDigest ? { tokenDigest: f.previous.tokenDigest } : {}),
+  ...(f.previous?.tokenCleared ? { tokenCleared: true as const } : {}),
 });
 export const ResourceLogStreamProvider = () =>
   restProvider(ResourceLogStream, {
@@ -428,6 +457,15 @@ export const ResourceLogStreamProvider = () =>
     immutable: ["resourceId"],
     createMethod: "PUT",
     updateMethod: "PUT",
+    validate: (props) =>
+      (props.setting === "send" && props.endpoint === undefined) ||
+      (props.setting === "drop" && props.endpoint !== undefined)
+        ? Effect.fail(
+            new RenderApiError(
+              "ResourceLogStream requires endpoint for send and forbids it for drop",
+            ),
+          )
+        : Effect.void,
     createPath: (id) => `/logs/streams/resource/${encodeURIComponent(id)}`,
     attributes: resourceLogAttrs,
     remoteDiff: false,
@@ -435,7 +473,7 @@ export const ResourceLogStreamProvider = () =>
       o.endpoint !== p.endpoint ||
       o.setting !== p.setting ||
       (p.token === null
-        ? o.tokenDigest !== undefined
+        ? o.tokenCleared !== true
         : p.token !== undefined && o.tokenDigest !== digest(p.token)),
     body: (p) => ({
       endpoint: p.endpoint,
@@ -447,20 +485,34 @@ export const ResourceLogStreamProvider = () =>
           : {}),
     }),
     afterWrite: (a, p) => {
-      const { tokenDigest: oldDigest, ...rest } = a;
+      const {
+        tokenDigest: oldDigest,
+        tokenCleared: wasCleared,
+        ...rest
+      } = a;
       const nextDigest =
         p.token === undefined
           ? oldDigest
           : p.token === null
             ? undefined
             : digest(p.token);
+      const tokenCleared =
+        p.token === undefined ? wasCleared : p.token === null ? true : undefined;
       return {
         ...rest,
         resourceId: p.resourceId,
         ...(nextDigest ? { tokenDigest: nextDigest } : {}),
+        ...(tokenCleared ? { tokenCleared: true as const } : {}),
       };
     },
   });
+
+const workflowEnvBody = (envVars: WorkflowProps["envVars"]) =>
+  envVars?.map((entry) =>
+    entry.value === undefined
+      ? { key: entry.key, generateValue: true }
+      : { key: entry.key, value: Redacted.value(entry.value) },
+  );
 
 const workflowEnvDigest = (envVars: WorkflowProps["envVars"]) =>
   envVars === undefined
@@ -468,12 +520,11 @@ const workflowEnvDigest = (envVars: WorkflowProps["envVars"]) =>
     : digest(
         Redacted.make(
           JSON.stringify(
-            [...envVars]
-              .sort((left, right) => left.key.localeCompare(right.key))
-              .map(({ key, value }) => ({
-                key,
-                value: Redacted.value(value),
-              })),
+            workflowEnvBody(
+              [...envVars].sort((left, right) =>
+                left.key.localeCompare(right.key),
+              ),
+            ),
           ),
         ),
       );
@@ -513,6 +564,20 @@ export const WorkflowProvider = () =>
       ...entity,
       autoDeployTrigger: entity.autoDeployTrigger ?? "commit",
     }),
+    validate: (props) => {
+      const invalid = props.envVars?.find((entry) => {
+        const hasValue = entry.value !== undefined;
+        const generatesValue = entry.generateValue === true;
+        return hasValue === generatesValue;
+      });
+      return invalid
+        ? Effect.fail(
+            new RenderApiError(
+              `Workflow env var ${invalid.key} requires exactly one of value or generateValue: true`,
+            ),
+          )
+        : Effect.void;
+    },
     replaceWhen: (_olds, props, output) =>
       output.envVarsDigest !== workflowEnvDigest(props.envVars),
     body: (p, name, ownerId) => ({
@@ -522,10 +587,7 @@ export const WorkflowProvider = () =>
       runCommand: p.runCommand,
       region: p.region,
       autoDeployTrigger: p.autoDeployTrigger ?? "commit",
-      envVars: p.envVars?.map((entry) => ({
-        key: entry.key,
-        value: Redacted.value(entry.value),
-      })),
+      envVars: workflowEnvBody(p.envVars),
     }),
     updateBody: (p, name) => ({
       name,

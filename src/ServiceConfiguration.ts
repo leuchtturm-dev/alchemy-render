@@ -20,12 +20,22 @@ import {
   type CommonAttributes,
 } from "./RestResource.js";
 
-export interface ServiceEnvVarProps {
+interface ServiceEnvVarBaseProps {
   readonly serviceId: string;
   readonly key: string;
-  readonly value?: Redacted.Redacted<string>;
-  readonly generateValue?: true;
 }
+
+export type ServiceEnvVarProps = ServiceEnvVarBaseProps &
+  (
+    | {
+        readonly value: Redacted.Redacted<string>;
+        readonly generateValue?: never;
+      }
+    | {
+        readonly value?: never;
+        readonly generateValue: true;
+      }
+  );
 export interface ServiceSecretFileProps {
   readonly serviceId: string;
   readonly name: string;
@@ -52,6 +62,8 @@ export interface RouteProps {
   readonly source: string;
   readonly destination: string;
   readonly type: "redirect" | "rewrite";
+  /** Zero-based rule order. Omit on create to append; omission on update leaves the current priority unchanged. */
+  readonly priority?: number;
 }
 export interface AutoscalingProps {
   readonly serviceId: string;
@@ -72,6 +84,12 @@ export interface SecretValueAttributes extends CommonAttributes {
 }
 export interface ServiceChildAttributes extends CommonAttributes {
   readonly serviceId: string;
+}
+export interface RouteAttributes extends ServiceChildAttributes {
+  readonly source: string;
+  readonly destination: string;
+  readonly type: RouteProps["type"];
+  readonly priority?: number;
 }
 export interface DiskAttributes extends ServiceChildAttributes {
   readonly diskId: string;
@@ -129,7 +147,7 @@ export type Header = Managed<
 >;
 export const Header = Resource.Resource<Header>("Render.Header");
 /** A static-site redirect or rewrite rule. @resource */
-export type Route = Managed<"Render.Route", RouteProps, ServiceChildAttributes>;
+export type Route = Managed<"Render.Route", RouteProps, RouteAttributes>;
 export const Route = Resource.Resource<Route>("Render.Route");
 /** Autoscaling configuration managed separately from the service. @resource */
 export type Autoscaling = Managed<
@@ -167,6 +185,16 @@ const secretAttrs = (
     typeof f.props === "object" &&
     f.props !== null &&
     (f.props as { readonly generateValue?: unknown }).generateValue === true;
+  const remoteValue =
+    typeof e.value === "string"
+      ? e.value
+      : typeof e.content === "string"
+        ? e.content
+        : undefined;
+  const valueDigest =
+    remoteValue === undefined
+      ? f.previous?.valueDigest
+      : digest(Redacted.make(remoteValue));
   return {
     id: f.id,
     generated: f.previous?.generated ?? generateValue,
@@ -175,7 +203,7 @@ const secretAttrs = (
       : typeof e.name === "string"
         ? { name: e.name }
         : {}),
-    ...(f.previous?.valueDigest ? { valueDigest: f.previous.valueDigest } : {}),
+    ...(valueDigest === undefined ? {} : { valueDigest }),
   };
 };
 export const ServiceEnvVarProvider = () =>
@@ -188,25 +216,32 @@ export const ServiceEnvVarProvider = () =>
     identity: "key",
     immutable: ["serviceId", "key"],
     createMethod: "PUT",
+    recoverPut: true,
     createPath: (key, p) =>
       `/services/${encodeURIComponent(p.serviceId)}/env-vars/${encodeURIComponent(key)}`,
     updateMethod: "PUT",
     remoteDiff: false,
     existingSatisfies: (_entity, props) =>
       props.generateValue === true && props.value === undefined,
+    validate: (props) => {
+      const hasValue = props.value !== undefined;
+      const generatesValue = props.generateValue === true;
+      return hasValue === generatesValue
+        ? Effect.fail(
+            new RenderApiError(
+              "ServiceEnvVar requires exactly one of value or generateValue: true",
+            ),
+          )
+        : Effect.void;
+    },
     sensitiveChanged: (_olds, news, output) =>
       news.value === undefined
         ? !output.generated
         : output.valueDigest !== digest(news.value),
-    body: (p) => {
-      if (p.value && p.generateValue)
-        throw new Error(
-          "ServiceEnvVar accepts either value or generateValue, not both",
-        );
-      if (!p.value && !p.generateValue)
-        throw new Error("ServiceEnvVar requires value or generateValue: true");
-      return p.value ? { value: reveal(p.value) } : { generateValue: true };
-    },
+    body: (p) =>
+      p.value === undefined
+        ? { generateValue: true }
+        : { value: reveal(p.value) },
     attributes: secretAttrs,
     afterWrite: (a, p) => {
       const { valueDigest: _oldDigest, ...rest } = a;
@@ -236,6 +271,7 @@ export const ServiceSecretFileProvider = () =>
     identity: "key",
     immutable: ["serviceId", "name"],
     createMethod: "PUT",
+    recoverPut: true,
     createPath: (name, p) =>
       `/services/${encodeURIComponent(p.serviceId)}/secret-files/${encodeURIComponent(name)}`,
     updateMethod: "PUT",
@@ -393,8 +429,13 @@ export const HeaderProvider = () =>
       `/services/${encodeURIComponent(p.serviceId)}/headers/${encodeURIComponent(id)}`,
     listable: false,
     nukeSkip: true,
+    ownerScoped: false,
     stables: ["serviceId"],
     lookupByList: true,
+    lookupQuery: (p) => ({
+      name: [p.name],
+      path: [p.path],
+    }),
     remoteMismatchAction: "replace",
     immutable: ["serviceId", "name", "path", "value"],
     matches: (e, _id, p) => e.name === p.name && e.path === p.path,
@@ -402,6 +443,30 @@ export const HeaderProvider = () =>
     attributes: childAttrs,
     afterWrite: (a, p) => ({ ...a, serviceId: p.serviceId }),
   });
+const routeAttrs = (
+  e: Record<string, unknown>,
+  f: { id: string; props?: RouteProps; previous?: RouteAttributes },
+): RouteAttributes => ({
+  ...childAttrs(e, f),
+  source:
+    typeof e.source === "string"
+      ? e.source
+      : (f.props?.source ?? f.previous?.source ?? ""),
+  destination:
+    typeof e.destination === "string"
+      ? e.destination
+      : (f.props?.destination ?? f.previous?.destination ?? ""),
+  type:
+    e.type === "redirect" || e.type === "rewrite"
+      ? e.type
+      : (f.props?.type ?? f.previous?.type ?? "rewrite"),
+  ...(typeof e.priority === "number"
+    ? { priority: e.priority }
+    : f.previous?.priority === undefined
+      ? {}
+      : { priority: f.previous.priority }),
+});
+
 export const RouteProvider = () =>
   restProvider(Route, {
     collection: (p) => `/services/${encodeURIComponent(p.serviceId)}/routes`,
@@ -409,18 +474,46 @@ export const RouteProvider = () =>
       `/services/${encodeURIComponent(p.serviceId)}/routes/${encodeURIComponent(id)}`,
     listable: false,
     nukeSkip: true,
+    ownerScoped: false,
+    nameFilter: false,
     stables: ["serviceId"],
     lookupByList: true,
-    remoteMismatchAction: "replace",
+    lookupQuery: (p) => ({
+      type: [p.type],
+      source: [p.source],
+    }),
     immutable: ["serviceId", "source", "destination", "type"],
+    validate: (props) =>
+      props.priority !== undefined &&
+      (!Number.isInteger(props.priority) || props.priority < 0)
+        ? Effect.fail(
+            new RenderApiError("Route priority must be a non-negative integer"),
+          )
+        : Effect.void,
+    replaceWhen: (_olds, props, output) => {
+      // Outputs persisted before RouteAttributes tracked the immutable rule
+      // fields must be refreshed from Render before deciding to replace.
+      const hasIdentitySnapshot =
+        typeof output.source === "string" &&
+        typeof output.destination === "string" &&
+        (output.type === "redirect" || output.type === "rewrite");
+      return (
+        hasIdentitySnapshot &&
+        (output.source !== props.source ||
+          output.destination !== props.destination ||
+          output.type !== props.type)
+      );
+    },
     resolveIdentity: (id) => Effect.succeed(id),
     matches: (e, _id, p) => e.source === p.source && e.type === p.type,
     body: (p) => ({
       source: p.source,
       destination: p.destination,
       type: p.type,
+      priority: p.priority,
     }),
-    attributes: childAttrs,
+    updateBody: (p) => ({ priority: p.priority }),
+    attributes: routeAttrs,
     afterWrite: (a, p) => ({ ...a, serviceId: p.serviceId }),
   });
 

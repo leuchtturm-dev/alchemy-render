@@ -2,6 +2,7 @@ import * as Action from "alchemy/Action";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
 import { RenderApi, RenderApiError } from "./Api/Api.js";
+import type { PostgresPlan } from "./Datastores.js";
 import type { ServicePlan } from "./Services.js";
 
 /** Render actions have at-least-once execution semantics. */
@@ -88,7 +89,7 @@ export interface FailoverPostgresProps extends PostgresProps {}
 export interface RecoverPostgresProps extends PostgresProps {
   readonly restoreTime: string;
   readonly restoreName?: string;
-  readonly plan?: string;
+  readonly plan?: PostgresPlan;
   readonly environmentId?: string;
   readonly datadogApiKey?: Redacted.Redacted<string>;
   readonly datadogSite?: string;

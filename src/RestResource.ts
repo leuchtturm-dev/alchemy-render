@@ -29,6 +29,8 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
   readonly collection: string | ((props: Props) => string);
   readonly item: (identity: string, props: Props) => string;
   readonly createMethod?: "POST" | "PUT";
+  /** Recover an indeterminate PUT create only when remote state is readable. */
+  readonly recoverPut?: boolean;
   readonly createPath?: (identity: string, props: Props) => string;
   readonly updateMethod?: "PATCH" | "PUT";
   readonly ownerScoped?: boolean;
@@ -130,6 +132,7 @@ interface Descriptor<Props extends object, Attrs extends CommonAttributes> {
     props: Props,
     api: RenderApiClient,
     phase: "read" | "create" | "update" | "reconcile",
+    previousProps?: Props,
   ) => Effect.Effect<Attrs, RenderApiError>;
 }
 
@@ -285,9 +288,15 @@ export const restProvider = <
         props: R["Props"],
         api: RenderApiClient,
         phase: "read" | "create" | "update" | "reconcile",
+        previousProps?: R["Props"],
       ) =>
-        descriptor.finalize?.(attributes, props, api, phase) ??
-        Effect.succeed(attributes);
+        descriptor.finalize?.(
+          attributes,
+          props,
+          api,
+          phase,
+          previousProps,
+        ) ?? Effect.succeed(attributes);
 
       const collection = (props: R["Props"]) =>
         typeof descriptor.collection === "string"
@@ -300,6 +309,7 @@ export const restProvider = <
         entity: Record<string, unknown>,
         identity: string,
         props: R["Props"],
+        strictIdentity = false,
       ) => {
         if (descriptor.filter && !descriptor.filter(entity, props))
           return false;
@@ -309,6 +319,9 @@ export const restProvider = <
           )
         )
           return true;
+        // Once Alchemy has persisted a physical ID, never fall back to a
+        // natural-key match. A same-name object is not the owned object.
+        if (strictIdentity) return false;
         if (descriptor.matches)
           return descriptor.matches(entity, identity, props);
         const keys =
@@ -323,6 +336,7 @@ export const restProvider = <
         api: RenderApiClient,
         identity: string,
         props: R["Props"],
+        strictIdentity = false,
       ) =>
         Effect.gen(function* () {
           let cursor: string | undefined;
@@ -340,18 +354,22 @@ export const restProvider = <
                 ...(descriptor.ownerScoped === false
                   ? {}
                   : { ownerId: [api.ownerId] }),
-                ...(!descriptor.lookupByList &&
-                descriptor.nameFilter !== false &&
-                (descriptor.identity === "name" ||
-                  descriptor.identity === undefined)
+                ...(!strictIdentity &&
+                  !descriptor.lookupByList &&
+                  descriptor.nameFilter !== false &&
+                  (descriptor.identity === "name" ||
+                    descriptor.identity === undefined)
                   ? { name: [identity] }
                   : {}),
-                ...descriptor.lookupQuery?.(props, identity, api.ownerId),
+                ...(strictIdentity
+                  ? {}
+                  : descriptor.lookupQuery?.(props, identity, api.ownerId)),
               },
             });
             const rows = unwrapRows(data);
             for (const { entity } of rows) {
-              if (!entityMatches(entity, identity, props)) continue;
+              if (!entityMatches(entity, identity, props, strictIdentity))
+                continue;
               const entityId = firstString(entity, [
                 "id",
                 "resourceId",
@@ -372,6 +390,17 @@ export const restProvider = <
             }
             const next = rows.at(-1)?.cursor;
             if (
+              descriptor.paginated !== false &&
+              !next &&
+              rows.length >= 100
+            ) {
+              return yield* Effect.fail(
+                new RenderApiError(
+                  "Render list response reached the requested limit without a pagination cursor",
+                ),
+              );
+            }
+            if (
               descriptor.paginated === false ||
               !next ||
               next === cursor ||
@@ -387,7 +416,7 @@ export const restProvider = <
         props: R["Props"],
       ) =>
         (descriptor.lookupByList
-          ? lookupEntity(api, identity, props)
+          ? lookupEntity(api, identity, props, true)
           : api
               .request({
                 method: "GET",
@@ -451,6 +480,17 @@ export const restProvider = <
                   }
                   const next = rows.at(-1)?.cursor;
                   if (
+                    descriptor.paginated !== false &&
+                    !next &&
+                    rows.length >= 100
+                  ) {
+                    return yield* Effect.fail(
+                      new RenderApiError(
+                        "Render list response reached the requested limit without a pagination cursor",
+                      ),
+                    );
+                  }
+                  if (
                     descriptor.paginated === false ||
                     !next ||
                     next === cursor ||
@@ -472,7 +512,12 @@ export const restProvider = <
                 descriptor.identity,
               ));
           if (descriptor.lookupByList) {
-            const found = yield* lookupEntity(api, identity, props);
+            const found = yield* lookupEntity(
+              api,
+              identity,
+              props,
+              output !== undefined,
+            );
             if (!found) return undefined;
             const remoteId =
               firstString(found, ["id", "resourceId"]) ?? identity;
@@ -628,6 +673,15 @@ export const restProvider = <
             resolvedOlds,
           ) ?? Effect.void;
           if (
+            descriptor.replaceWhen?.(
+              resolvedOlds ?? resolvedNews,
+              resolvedNews,
+              liveAttributes,
+            )
+          ) {
+            return { action: "replace" as const };
+          }
+          if (
             descriptor.sensitiveChanged?.(
               resolvedOlds ?? resolvedNews,
               resolvedNews,
@@ -650,11 +704,12 @@ export const restProvider = <
           const bodyIdentity =
             desiredIdentity(resolvedNews as Record<string, unknown>) ??
             output.name ??
-            (yield* physicalIdentity(
-              id,
-              resolvedNews as Record<string, unknown>,
-              descriptor.identity,
-            ));
+            (yield* descriptor.resolveIdentity?.(id, resolvedNews) ??
+              physicalIdentity(
+                id,
+                resolvedNews as Record<string, unknown>,
+                descriptor.identity,
+              ));
           const desired = (
             descriptor.compareBody ??
             descriptor.updateBody ??
@@ -688,15 +743,12 @@ export const restProvider = <
               props as Record<string, unknown>,
               descriptor.identity,
             );
-          let liveEntity = output
+          // Cold name lookup belongs to read/adoption. Reconcile may only
+          // mutate a persisted physical ID; if it disappeared, create and let
+          // any natural-key conflict fail instead of taking over a stranger.
+          const liveEntity = output
             ? yield* getEntity(api, output.id, props)
             : undefined;
-          if (!liveEntity) {
-            liveEntity =
-              canList || descriptor.lookupByList
-                ? yield* lookupEntity(api, identity, props)
-                : yield* getEntity(api, identity, props);
-          }
           const existingId = liveEntity
             ? (firstString(liveEntity, ["id", "serviceId", "resourceId"]) ??
               output?.id ??
@@ -737,7 +789,7 @@ export const restProvider = <
           )(props, bodyIdentity, api.ownerId, observedAttributes);
           if (
             liveEntity &&
-            output === undefined &&
+            !sensitiveNeedsWrite &&
             descriptor.existingSatisfies?.(liveEntity, props)
           ) {
             return yield* finalize(
@@ -747,6 +799,20 @@ export const restProvider = <
               descriptor.reconcileOnNoop && sensitiveNeedsWrite
                 ? "reconcile"
                 : "read",
+              previousProps,
+            );
+          }
+          if (
+            liveEntity &&
+            descriptor.remoteDiff === false &&
+            !sensitiveNeedsWrite
+          ) {
+            return yield* finalize(
+              observedAttributes!,
+              props,
+              api,
+              "read",
+              previousProps,
             );
           }
           if (
@@ -776,11 +842,15 @@ export const restProvider = <
                 (output !== undefined || sensitiveNeedsWrite)
                   ? "reconcile"
                   : "read",
+                previousProps,
               );
             }
           }
-          let writeId = existingId;
-          let recoveredCreate = false;
+          const writeId = existingId;
+          // Render does not expose idempotency keys for POST creates. Surface
+          // an indeterminate result rather than claiming whichever same-name
+          // object appears afterward. A PUT create can be recovered only when
+          // a strict read of that same address proves the desired state.
           const data = yield* api
             .request({
               method: writeId
@@ -795,26 +865,57 @@ export const restProvider = <
             .pipe(
               Effect.catch((error: RenderApiError) => {
                 if (
-                  writeId ||
+                  writeId !== undefined ||
+                  descriptor.createMethod !== "PUT" ||
+                  descriptor.recoverPut !== true ||
                   (error.status !== undefined && error.status < 500)
                 ) {
                   return Effect.fail(error);
                 }
-                const observe =
-                  canList || descriptor.lookupByList
-                    ? lookupEntity(api, identity, props)
-                    : getEntity(api, identity, props);
-                return observe.pipe(
-                  Effect.flatMap((conflict) => {
-                    if (!conflict) return Effect.fail(error);
-                    writeId =
-                      firstString(conflict, [
-                        "id",
-                        "serviceId",
-                        "resourceId",
-                      ]) ?? identity;
-                    recoveredCreate = true;
-                    return Effect.succeed(conflict);
+                return getEntity(api, identity, props).pipe(
+                  Effect.flatMap((recovered) => {
+                    if (
+                      recovered === undefined ||
+                      descriptor.existingSatisfies?.(recovered, props)
+                    ) {
+                      return Effect.fail(error);
+                    }
+                    const recoveredAttributes = makeAttrs(recovered, {
+                      id: identity,
+                      identity,
+                      ownerId: api.ownerId,
+                      props,
+                      ...(observedAttributes === undefined
+                        ? {}
+                        : { previous: observedAttributes }),
+                    });
+                    const sensitiveMatches =
+                      descriptor.sensitiveChanged !== undefined &&
+                      !descriptor.sensitiveChanged(
+                        previousProps ?? props,
+                        props,
+                        recoveredAttributes,
+                      );
+                    const observed = descriptor.observe
+                      ? descriptor.observe(recovered)
+                      : recovered;
+                    const comparable = (
+                      descriptor.compareBody ??
+                      descriptor.updateBody ??
+                      descriptor.body
+                    )(
+                      props,
+                      bodyIdentity,
+                      api.ownerId,
+                      recoveredAttributes,
+                    );
+                    const verified =
+                      descriptor.remoteDiff === false
+                        ? sensitiveMatches
+                        : matchesDesired(observed, comparable);
+                    return verified
+                      ? Effect.succeed(recovered)
+                      : Effect.fail(error);
                   }),
                 );
               }),
@@ -831,16 +932,6 @@ export const restProvider = <
                 : { previous: observedAttributes }),
             },
           );
-          if (recoveredCreate) {
-            return yield* finalize(
-              descriptor.afterWrite
-                ? descriptor.afterWrite(result, props)
-                : result,
-              props,
-              api,
-              "create",
-            );
-          }
           return yield* finalize(
             descriptor.afterWrite
               ? descriptor.afterWrite(result, props)
@@ -848,6 +939,7 @@ export const restProvider = <
             props,
             api,
             writeId ? "update" : "create",
+            previousProps,
           );
         }),
         delete: Effect.fn(function* ({ output, olds }) {

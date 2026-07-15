@@ -9,6 +9,7 @@ import {
 } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
+  matchesDesired,
   moveEnvironmentResource,
   restProvider,
   unwrapEntity,
@@ -69,6 +70,7 @@ const ALLOW_ALL_IPS = [
 export interface NativeSource {
   readonly runtime: NativeRuntime;
   readonly repo: string;
+  /** Omit on create to use the repository default; omission on update leaves the current branch unchanged. */
   readonly branch?: string;
   readonly buildCommand: string;
   readonly startCommand: string;
@@ -82,6 +84,7 @@ export interface NativeSource {
 export interface DockerSource {
   readonly runtime: "docker";
   readonly repo: string;
+  /** Omit on create to use the repository default; omission on update leaves the current branch unchanged. */
   readonly branch?: string;
   readonly dockerCommand?: string;
   readonly dockerContext?: string;
@@ -98,11 +101,12 @@ export interface ImageSource {
     readonly imagePath: string;
     readonly registryCredentialId?: string;
   };
+  /** Override the image's default command. */
+  readonly dockerCommand?: string;
   readonly repo?: never;
   readonly branch?: never;
   readonly buildCommand?: never;
   readonly startCommand?: never;
-  readonly dockerCommand?: never;
   readonly dockerContext?: never;
   readonly dockerfilePath?: never;
   readonly registryCredentialId?: never;
@@ -189,7 +193,7 @@ export type CronJobProps = CronJobConfiguration & ServiceSourceProps;
 export interface StaticSiteProps extends ServiceDeploymentProps {
   readonly name?: string;
   readonly repo: string;
-  /** Omit to use the repository's default branch. */
+  /** Omit on create to use the repository default; omission on update leaves the current branch unchanged. */
   readonly branch?: string;
   readonly autoDeploy?: AutoDeploy;
   readonly rootDir?: string;
@@ -288,11 +292,37 @@ const envSpecificDetails = (props: ServiceSourceProps) => {
       registryCredentialId: props.registryCredentialId,
     };
   }
-  if (props.runtime === "image") return {};
+  if (props.runtime === "image") {
+    return { dockerCommand: props.dockerCommand };
+  }
   return {
     buildCommand: props.buildCommand,
     startCommand: props.startCommand,
   };
+};
+
+// Cron create uses Render's legacy full Docker-details shape. Unlike the
+// PATCH shape, all three strings must be present and registry credentials are
+// nested. Render's first-party Terraform provider emits the same wire shape.
+const cronCreateEnvSpecificDetails = (props: ServiceSourceProps) => {
+  if (props.runtime === "docker") {
+    return {
+      dockerCommand: props.dockerCommand ?? "",
+      dockerContext: props.dockerContext ?? "",
+      dockerfilePath: props.dockerfilePath ?? "",
+      ...(props.registryCredentialId === undefined
+        ? {}
+        : { registryCredential: { id: props.registryCredentialId } }),
+    };
+  }
+  if (props.runtime === "image") {
+    return {
+      dockerCommand: props.dockerCommand ?? "",
+      dockerContext: "",
+      dockerfilePath: "",
+    };
+  }
+  return envSpecificDetails(props);
 };
 
 const validateSource = (props: ServiceSourceProps) => {
@@ -424,7 +454,10 @@ const createDetails = (
   validateNumInstances(serviceCore.numInstances);
   return {
     runtime: service.runtime,
-    envSpecificDetails: envSpecificDetails(service),
+    envSpecificDetails:
+      kind === "cron_job"
+        ? cronCreateEnvSpecificDetails(service)
+        : envSpecificDetails(service),
     plan: service.plan,
     region: service.region,
     preDeployCommand:
@@ -469,6 +502,11 @@ const updateDetails = (
   const details = createDetails(kind, props) as Record<string, unknown>;
   delete details.region;
   delete details.numInstances;
+  if (kind === "cron_job") {
+    details.envSpecificDetails = envSpecificDetails(
+      props as ServiceSourceProps,
+    );
+  }
   if (kind === "static_site") {
     const site = props as StaticSiteProps;
     details.previews = site.previews ?? { generation: "off" };
@@ -796,15 +834,34 @@ const provider = <R extends ManagedService>(
         Effect.map((observed) => observed !== digest),
       );
     },
-    finalize: (service, props, api, phase) =>
+    finalize: (service, props, api, phase, previousProps) =>
       Effect.gen(function* () {
         let current = service;
+        const ownerId = current.ownerId ?? api.ownerId;
+        const desiredName = props.name ?? current.name ?? current.serviceId;
         const desiredCoreDigest = coreDigest(
           kind,
           props,
-          props.name ?? current.name ?? current.serviceId,
-          current.ownerId ?? api.ownerId,
+          desiredName,
+          ownerId,
         );
+        const coreTransitionRequired =
+          previousProps === undefined ||
+          !matchesDesired(
+            {
+              ...updateBody(
+                kind,
+                previousProps,
+                previousProps.name ?? current.name ?? current.serviceId,
+                ownerId,
+              ),
+              environmentId: previousProps.environmentId,
+            },
+            {
+              ...updateBody(kind, props, desiredName, ownerId),
+              environmentId: props.environmentId,
+            },
+          );
         const hasManagedWebCache =
           kind === "web_service" &&
           (props as WebServiceProps).cache !== undefined;
@@ -817,7 +874,8 @@ const provider = <R extends ManagedService>(
           hasUnknownCacheTransition ||
           (phase === "reconcile" &&
             current.coreDigest !== undefined &&
-            current.coreDigest !== desiredCoreDigest);
+            current.coreDigest !== desiredCoreDigest &&
+            coreTransitionRequired);
         let deploymentToWaitFor =
           phase === "create" ? current.deployId : undefined;
         if (
@@ -930,6 +988,12 @@ const provider = <R extends ManagedService>(
             });
             current = { ...current, numInstances: desired.numInstances };
           }
+        }
+
+        if (phase !== "read" && !needsDeployment) {
+          // Dropping an optional PATCH field releases management of that
+          // field; it is not a configuration transition that needs a deploy.
+          current = { ...current, coreDigest: desiredCoreDigest };
         }
 
         if (phase !== "read" && needsDeployment) {

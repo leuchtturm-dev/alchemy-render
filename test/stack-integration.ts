@@ -27,7 +27,53 @@ const compileTimeInvalidInputs = () => {
     deployMode: "deploy_only",
     commitId: "abc123",
   };
-  return { invalidNative, invalidImage, invalidDockerCron, invalidDeploy };
+  // @ts-expect-error A service variable requires a value or generation.
+  const invalidEmptyEnvVar: Render.ServiceEnvVarProps = {
+    serviceId: "srv-example",
+    key: "TOKEN",
+  };
+  // @ts-expect-error A service variable cannot provide and generate a value.
+  const invalidDoubleEnvVar: Render.ServiceEnvVarProps = {
+    serviceId: "srv-example",
+    key: "TOKEN",
+    value: Redacted.make("secret"),
+    generateValue: true,
+  };
+  // @ts-expect-error An environment-group variable requires a value or generation.
+  const invalidEmptyGroupEnvVar: Render.EnvironmentGroupEnvVarProps = {
+    environmentGroupId: "evg-example",
+    key: "TOKEN",
+  };
+  // @ts-expect-error An environment-group variable cannot provide and generate a value.
+  const invalidDoubleGroupEnvVar: Render.EnvironmentGroupEnvVarProps = {
+    environmentGroupId: "evg-example",
+    key: "TOKEN",
+    value: Redacted.make("secret"),
+    generateValue: true,
+  };
+  // @ts-expect-error Sending logs requires an endpoint.
+  const invalidSendStream: Render.ResourceLogStreamProps = {
+    resourceId: "srv-example",
+    setting: "send",
+  };
+  // @ts-expect-error Dropping logs forbids an endpoint.
+  const invalidDropStream: Render.ResourceLogStreamProps = {
+    resourceId: "srv-example",
+    setting: "drop",
+    endpoint: "https://logs.example.com",
+  };
+  return {
+    invalidNative,
+    invalidImage,
+    invalidDockerCron,
+    invalidDeploy,
+    invalidEmptyEnvVar,
+    invalidDoubleEnvVar,
+    invalidEmptyGroupEnvVar,
+    invalidDoubleGroupEnvVar,
+    invalidSendStream,
+    invalidDropStream,
+  };
 };
 void compileTimeInvalidInputs;
 

@@ -4,7 +4,7 @@ import * as Provider from "alchemy/Provider";
 import * as Resource from "alchemy/Resource";
 import * as Effect from "effect/Effect";
 import * as Redacted from "effect/Redacted";
-import { RenderApi, type RenderApiError } from "./Api/Api.js";
+import { RenderApi, RenderApiError } from "./Api/Api.js";
 import type { Providers } from "./Providers.js";
 import {
   resourceClass,
@@ -24,11 +24,22 @@ export interface EnvironmentGroupLinkProps {
   readonly environmentGroupId: string;
   readonly serviceId: string;
 }
-export interface EnvironmentGroupEnvVarProps {
+interface EnvironmentGroupEnvVarBaseProps {
   readonly environmentGroupId: string;
   readonly key: string;
-  readonly value: Redacted.Redacted<string>;
 }
+
+export type EnvironmentGroupEnvVarProps = EnvironmentGroupEnvVarBaseProps &
+  (
+    | {
+        readonly value: Redacted.Redacted<string>;
+        readonly generateValue?: never;
+      }
+    | {
+        readonly value?: never;
+        readonly generateValue: true;
+      }
+  );
 export interface EnvironmentGroupSecretFileProps {
   readonly environmentGroupId: string;
   readonly name: string;
@@ -44,6 +55,7 @@ export interface EnvironmentGroupLinkAttributes extends CommonAttributes {
 }
 export interface SecretAttributes extends CommonAttributes {
   readonly valueDigest?: string;
+  readonly generated?: boolean;
 }
 
 type Managed<
@@ -220,16 +232,33 @@ export const EnvironmentGroupLinkProvider = () =>
 
 const secretAttrs = (
   e: Record<string, unknown>,
-  f: { id: string; previous?: SecretAttributes },
-): SecretAttributes => ({
-  id: f.id,
-  ...(typeof e.key === "string"
-    ? { name: e.key }
-    : typeof e.name === "string"
-      ? { name: e.name }
-      : {}),
-  ...(f.previous?.valueDigest ? { valueDigest: f.previous.valueDigest } : {}),
-});
+  f: { id: string; previous?: SecretAttributes; props?: unknown },
+): SecretAttributes => {
+  const generateValue =
+    typeof f.props === "object" &&
+    f.props !== null &&
+    (f.props as { readonly generateValue?: unknown }).generateValue === true;
+  const remoteValue =
+    typeof e.value === "string"
+      ? e.value
+      : typeof e.content === "string"
+        ? e.content
+        : undefined;
+  const valueDigest =
+    remoteValue === undefined
+      ? f.previous?.valueDigest
+      : digest(Redacted.make(remoteValue));
+  return {
+    id: f.id,
+    generated: f.previous?.generated ?? generateValue,
+    ...(typeof e.key === "string"
+      ? { name: e.key }
+      : typeof e.name === "string"
+        ? { name: e.name }
+        : {}),
+    ...(valueDigest === undefined ? {} : { valueDigest }),
+  };
+};
 export const EnvironmentGroupEnvVarProvider = () =>
   restProvider(EnvironmentGroupEnvVar, {
     collection: (p) =>
@@ -241,15 +270,41 @@ export const EnvironmentGroupEnvVarProvider = () =>
     identity: "key",
     immutable: ["environmentGroupId", "key"],
     createMethod: "PUT",
+    recoverPut: true,
     createPath: (key, p) =>
       `/env-groups/${encodeURIComponent(p.environmentGroupId)}/env-vars/${encodeURIComponent(key)}`,
     updateMethod: "PUT",
     remoteDiff: false,
+    existingSatisfies: (_entity, props) =>
+      props.generateValue === true && props.value === undefined,
+    validate: (props) => {
+      const hasValue = props.value !== undefined;
+      const generatesValue = props.generateValue === true;
+      return hasValue === generatesValue
+        ? Effect.fail(
+            new RenderApiError(
+              "EnvironmentGroupEnvVar requires exactly one of value or generateValue: true",
+            ),
+          )
+        : Effect.void;
+    },
     sensitiveChanged: (_olds, news, output) =>
-      output.valueDigest !== digest(news.value),
-    body: (p) => ({ value: reveal(p.value) }),
+      news.value === undefined
+        ? output.generated !== true
+        : output.valueDigest !== digest(news.value),
+    body: (p) =>
+      p.value === undefined
+        ? { generateValue: true }
+        : { value: reveal(p.value) },
     attributes: secretAttrs,
-    afterWrite: (a, p) => ({ ...a, valueDigest: digest(p.value) }),
+    afterWrite: (a, p) => {
+      const { valueDigest: _oldDigest, ...rest } = a;
+      return {
+        ...rest,
+        generated: p.value === undefined,
+        ...(p.value === undefined ? {} : { valueDigest: digest(p.value) }),
+      };
+    },
   });
 export const EnvironmentGroupSecretFileProvider = () =>
   restProvider(EnvironmentGroupSecretFile, {
@@ -262,6 +317,7 @@ export const EnvironmentGroupSecretFileProvider = () =>
     identity: "key",
     immutable: ["environmentGroupId", "name"],
     createMethod: "PUT",
+    recoverPut: true,
     createPath: (name, p) =>
       `/env-groups/${encodeURIComponent(p.environmentGroupId)}/secret-files/${encodeURIComponent(name)}`,
     updateMethod: "PUT",

@@ -1,6 +1,6 @@
 # alchemy-render
 
-An Effect-native [Alchemy v2](https://v2.alchemy.run/) provider for [Render](https://render.com/). It follows Alchemy's first-party provider model: typed `Resource` declarations, idempotent reconcilers, an Effect `ProviderCollection`, profile-aware lazy credentials, and a generated typed API escape hatch.
+An Effect-native [Alchemy v2](https://v2.alchemy.run/) provider for [Render](https://render.com/). It follows Alchemy's first-party provider model: typed `Resource` declarations, drift-aware reconcilers, an Effect `ProviderCollection`, profile-aware lazy credentials, and a generated typed API escape hatch.
 
 > Alchemy v2 is currently beta. This release is tested with `alchemy@2.0.0-beta.62` and `effect@4.0.0-beta.97`.
 
@@ -79,7 +79,7 @@ For tests or embedding, `Render.fromApiKey({ apiKey, ownerId, apiBaseUrl? })` pr
 
 All five service Resources can own `env` as their complete service environment. It accepts a readonly record of `Redacted<string>` values. An explicit empty object removes all environment variables; omitting `env` leaves environment variables unmanaged.
 
-`WebService`, `PrivateService`, and `BackgroundWorker` can additionally own `numInstances` as their fixed/manual instance count. Omit it when another system manages scaling. Repository, Docker, and image sources are modeled as a discriminated union, so incompatible or incomplete source combinations fail typechecking.
+`WebService`, `PrivateService`, and `BackgroundWorker` can additionally own `numInstances` as their fixed/manual instance count. Omit it when another system manages scaling. Repository, Docker, and image sources are modeled as a discriminated union, so incompatible or incomplete source combinations fail typechecking. Omitting `branch` on create uses the repository default; omitting a previously explicit branch on update releases that field and leaves Render's current branch unchanged because the PATCH API defines no reset-to-default operation.
 
 Other independently addressable configuration remains available through standalone Resources: secret files, custom domains, disks, static-site headers and routes, autoscaling, environment links, log streams, and notification overrides. Changing a resource's high-level `environmentId` moves it through Render's environment membership API instead of replacing it.
 
@@ -87,11 +87,13 @@ Do not mix service-owned `env` with `ServiceEnvVar` for the same service: aggreg
 
 Do not let two stacks—or a Resource and another tool—authoritatively manage the same child object. Header and route field changes replace the rule because headers have no item-update endpoint and route PATCH only changes priority. Workflow environment variables are create-only in the API, so adding, removing, or rotating one replaces the Workflow.
 
-On a cold read, name-addressable Render objects are returned as `Unowned`. Deploy with Alchemy's `--adopt` flow only after confirming the matching object is safe to take over. Reads by a previously persisted physical ID remain owned. Resources that cannot be enumerated without a parent are explicitly excluded from `alchemy unsafe nuke`; ordinary stack deletion still removes them.
+On a cold read, name-addressable Render objects are returned as `Unowned`. Deploy with Alchemy's `--adopt` flow only after confirming the matching object is safe to take over. Reads by a previously persisted physical ID remain owned. If that physical ID disappears, reconciliation never falls back to a same-name object; it attempts a create and lets any name conflict fail. Within the current reconciliation, an indeterminate POST create is surfaced instead of claiming a same-name object that appears afterward.
+
+Render exposes no general ownership marker or idempotency key. In Alchemy v2 beta, a later interrupted-create recovery probe can therefore not prove that an explicitly named same-name object came from the failed request. Inspect Render before retrying an indeterminate create; generated physical names include Alchemy's random instance suffix and provide the strongest recovery identity. Resources that cannot be enumerated without a parent are explicitly excluded from `alchemy unsafe nuke`; ordinary stack deletion still removes them. A full 100-item list response without the cursor declared by Render's request contract fails closed instead of silently treating the page as exhaustive.
 
 ## Secrets and state
 
-Secret inputs use `Redacted<string>`. Write-only values such as registry tokens, stream tokens, env vars, and secret-file contents are never copied into Attributes; state stores a SHA-256 equality digest instead. Database connection values and webhook signing secrets are returned as `Redacted` outputs.
+Secret inputs use `Redacted<string>`. Plaintext is never copied into Attributes: readable environment variables and secret files are hashed immediately during remote reads, while write-only registry and stream tokens retain only a SHA-256 equality digest of the last managed value. Database connection values and webhook signing secrets are returned as `Redacted` outputs. Cold adoption of an env var declared with `generateValue: true` assumes the existing value should be preserved rather than rotating it; a later explicit value-to-generated transition performs the rotation.
 
 A digest is not encryption, and resource state still contains infrastructure metadata. Protect state and credential files accordingly. API errors retain only numeric status and a server request ID; response bodies and status text are discarded because they can echo secret input.
 
