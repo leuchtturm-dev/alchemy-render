@@ -209,6 +209,87 @@ describe("representative resource lifecycles", () => {
     });
   });
 
+  it("does not materialize omitted optional service fields during an update", async () => {
+    let patchBody: unknown;
+    let dockerCommand = "hermes dashboard";
+    const service = () => ({
+      id: "srv-1",
+      name: "api",
+      ownerId: "tea-test",
+      type: "web_service",
+      imagePath: "docker.io/acme/hermes:latest",
+      autoDeploy: "no",
+      serviceDetails: {
+        runtime: "image",
+        envSpecificDetails: { dockerCommand },
+        plan: "starter",
+        region: "oregon",
+      },
+    });
+    // SAFETY: The test adapter implements the Fetch contract for every request used by this scenario.
+    const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const request = new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (request.method === "POST" && path.endsWith("/services")) {
+        return json({ service: service(), deployId: "dep-create" }, 201);
+      }
+      if (request.method === "GET") return json(service());
+      if (request.method === "PATCH") {
+        patchBody = await request.json();
+        dockerCommand = "hermes dashboard --no-open";
+        return json(service());
+      }
+      if (request.method === "POST" && path.endsWith("/deploys")) {
+        return json({ id: "dep-update" }, 201);
+      }
+      return json({ message: "unexpected request" }, 500);
+    }) as typeof globalThis.fetch;
+    const olds = {
+      name: "api",
+      runtime: "image" as const,
+      image: { imagePath: "docker.io/acme/hermes:latest" },
+      dockerCommand,
+      plan: "starter" as const,
+      region: "oregon" as const,
+      autoDeploy: "no" as const,
+    };
+    const news = {
+      ...olds,
+      dockerCommand: "hermes dashboard --no-open",
+    };
+
+    await runPromise(
+      Effect.gen(function* () {
+        const provider = yield* WebService.Provider;
+        const created = yield* provider.reconcile(reconcileInput(olds));
+        yield* provider.reconcile({
+          ...reconcileInput(news, created),
+          olds,
+        });
+      }).pipe(
+        Effect.provide(
+          WebServiceProvider().pipe(Layer.provide(withApi(fetch))),
+        ),
+      ),
+    );
+
+    expect(patchBody).toBeDefined();
+    expect(patchBody).not.toHaveProperty("autoDeploy");
+    expect(patchBody).not.toHaveProperty("buildFilter");
+    expect(patchBody).not.toHaveProperty("rootDir");
+    expect(patchBody).not.toHaveProperty("serviceDetails.healthCheckPath");
+    expect(patchBody).not.toHaveProperty("serviceDetails.ipAllowList");
+    expect(patchBody).not.toHaveProperty("serviceDetails.maintenanceMode");
+    expect(patchBody).not.toHaveProperty(
+      "serviceDetails.maxShutdownDelaySeconds",
+    );
+    expect(patchBody).not.toHaveProperty("serviceDetails.preDeployCommand");
+    expect(patchBody).not.toHaveProperty("serviceDetails.previews");
+    expect(patchBody).not.toHaveProperty(
+      "serviceDetails.renderSubdomainPolicy",
+    );
+  });
+
   it("sends the required empty environments collection when creating a Project", async () => {
     let body: unknown;
     const fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {

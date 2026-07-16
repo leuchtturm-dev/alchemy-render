@@ -530,25 +530,22 @@ const updateDetails = (
   }
   if (kind === "static_site") {
     const site = props as StaticSiteProps;
-    details.previews = site.previews ?? { generation: "off" };
-    details.renderSubdomainPolicy = site.renderSubdomainPolicy ?? "enabled";
-    details.ipAllowList = site.ipAllowList ?? ALLOW_ALL_IPS;
+    details.previews = site.previews;
+    details.renderSubdomainPolicy = site.renderSubdomainPolicy;
+    details.ipAllowList = site.ipAllowList;
   } else if (kind !== "cron_job") {
     const service = props as ServiceCoreProps;
-    details.preDeployCommand = service.preDeployCommand ?? "";
-    details.previews = service.previews ?? { generation: "off" };
-    details.maxShutdownDelaySeconds = service.maxShutdownDelaySeconds ?? 30;
+    details.preDeployCommand = service.preDeployCommand;
+    details.previews = service.previews;
+    details.maxShutdownDelaySeconds = service.maxShutdownDelaySeconds;
   }
   if (kind === "web_service") {
     const web = props as WebServiceProps;
-    details.healthCheckPath = web.healthCheckPath ?? "";
-    details.maintenanceMode = web.maintenanceMode ?? {
-      enabled: false,
-      uri: "",
-    };
-    details.renderSubdomainPolicy = web.renderSubdomainPolicy ?? "enabled";
-    details.cache = web.cache ?? { profile: "no-cache" };
-    details.ipAllowList = web.ipAllowList ?? ALLOW_ALL_IPS;
+    details.healthCheckPath = web.healthCheckPath;
+    details.maintenanceMode = web.maintenanceMode;
+    details.renderSubdomainPolicy = web.renderSubdomainPolicy;
+    details.cache = web.cache;
+    details.ipAllowList = web.ipAllowList;
   }
   return details;
 };
@@ -596,9 +593,13 @@ const updateBody = (
   ownerId: string,
 ) => ({
   name,
-  autoDeploy: props.autoDeploy ?? "yes",
-  rootDir: props.rootDir ?? "",
-  buildFilter: props.buildFilter ?? { paths: [], ignoredPaths: [] },
+  // Prebuilt image services do not support repository auto-deploy updates.
+  autoDeploy:
+    "runtime" in props && props.runtime === "image"
+      ? undefined
+      : props.autoDeploy,
+  rootDir: props.rootDir,
+  buildFilter: props.buildFilter,
   ...(kind === "static_site"
     ? { repo: props.repo, branch: props.branch }
     : sourceBody(props as ServiceSourceProps, ownerId)),
