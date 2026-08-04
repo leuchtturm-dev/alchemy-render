@@ -96,7 +96,7 @@
     "generate:api": "node scripts/generate-api.mjs",
     "check:api": "node scripts/check-generated-api.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
-    "prepack": "npm run build"
+    "prepack": "npm run clean && tsc -p tsconfig.build.json"
   },
   "peerDependencies": {
     "alchemy": ">=2.0.0-beta.62 <2.1",
