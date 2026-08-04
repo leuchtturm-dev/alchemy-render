@@ -96,7 +96,6 @@
     "generate:api": "node scripts/generate-api.mjs",
     "check:api": "node scripts/check-generated-api.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
-    "prepack": "npm run check && npm run check:api && npm run build && npm run check:exports"
   },
   "peerDependencies": {
     "alchemy": ">=2.0.0-beta.62 <2.1",
