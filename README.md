@@ -5,7 +5,7 @@ An Effect-native [Alchemy v2](https://v2.alchemy.run/) provider for [Render](htt
 > Alchemy v2 is currently beta. This release is tested with `alchemy@2.0.0-beta.62` and `effect@4.0.0-beta.97`.
 
 ```sh
-bun add alchemy-render alchemy@2.0.0-beta.62 effect@4.0.0-beta.97
+pnpm add alchemy-render alchemy@2.0.0-beta.62 effect@4.0.0-beta.97
 ```
 
 ## Quick start
@@ -27,8 +27,8 @@ export default Alchemy.Stack(
       repo: "https://github.com/acme/my-app",
       branch: "main",
       runtime: "node",
-      buildCommand: "bun install",
-      startCommand: "bun run start",
+      buildCommand: "pnpm install --frozen-lockfile",
+      startCommand: "pnpm start",
       plan: "starter",
       region: "oregon",
       numInstances: 2,
@@ -169,8 +169,8 @@ The generated schema is internal to transport typing; curated Resource props and
 `src/Api/schema.ts` is checked in. Normal install, typecheck, test, build, and prepack never access the network.
 
 ```sh
-npm run generate:api  # explicitly fetch and regenerate from Render's spec
-npm run check:api     # offline declaration checksum check
+pnpm generate:api  # explicitly fetch and regenerate from Render's spec
+pnpm check:api     # offline declaration checksum check
 ```
 
 Generation records the source URL, source SHA-256, and declaration SHA-256 without a timestamp so identical input is deterministic. The offline check verifies the checked-in header and declaration integrity; only explicit regeneration verifies the source checksum against the live Render document. Render explicitly warns that the structure of its OpenAPI document can change even while the wire API remains backward compatible; review generated diffs before committing them.
@@ -178,10 +178,10 @@ Generation records the source URL, source SHA-256, and declaration SHA-256 witho
 ## Validation and acceptance tests
 
 ```sh
-bun run typecheck
-bun test
-bun run build
-npm pack --dry-run
+pnpm typecheck
+pnpm test
+pnpm build
+pnpm pack --dry-run
 ```
 
 The default suite uses mocked HTTP and creates no billable infrastructure. Real-account acceptance testing should use a disposable Render workspace and is intentionally opt-in. Validate create/update/adopt/delete behavior and clean up through both Alchemy and the Render dashboard.

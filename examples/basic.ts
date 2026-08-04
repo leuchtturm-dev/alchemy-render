@@ -10,8 +10,8 @@ export const basic = Effect.gen(function* () {
     branch: "main",
     runtime: "node",
     plan: "starter",
-    buildCommand: "bun install",
-    startCommand: "bun run start",
+    buildCommand: "pnpm install --frozen-lockfile",
+    startCommand: "pnpm start",
     numInstances: 2,
     env: {
       API_TOKEN: Redacted.make("replace-me"),

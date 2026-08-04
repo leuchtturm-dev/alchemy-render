@@ -18,7 +18,7 @@ const source = file.match(/Source SHA-256: ([a-f0-9]{64})/)?.[1];
 const actual = createHash("sha256").update(declarations).digest("hex");
 if (!expected || expected !== actual) {
   throw new Error(
-    `generated API checksum mismatch (expected ${expected ?? "missing"}, actual ${actual}); run npm run generate:api`,
+    `generated API checksum mismatch (expected ${expected ?? "missing"}, actual ${actual}); run pnpm generate:api`,
   );
 }
 if (!source) {
@@ -38,7 +38,7 @@ const expectedHeader = `// @ts-nocheck -- Render's upstream schema contains recu
 const header = file.slice(0, bodyAt + 1);
 if (header !== expectedHeader) {
   throw new Error(
-    "generated API header or pre-declaration content changed; run npm run generate:api",
+    "generated API header or pre-declaration content changed; run pnpm generate:api",
   );
 }
 
