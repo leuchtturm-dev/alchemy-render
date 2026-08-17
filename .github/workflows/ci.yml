@@ -32,7 +32,7 @@ jobs:
         run: pnpm test
       - name: Check generated API
         run: pnpm check:api
-      - name: Build and smoke-test package exports
-        run: pnpm build && pnpm check:exports
-      - name: Inspect package contents
-        run: pnpm pack --dry-run
+      - name: Check committed build and smoke-test package exports
+        run: pnpm check:dist && pnpm check:exports
+      - name: Inspect package contents without build scripts
+        run: npm pack --dry-run --ignore-scripts

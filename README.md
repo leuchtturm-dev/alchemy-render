@@ -180,9 +180,12 @@ Generation records the source URL, source SHA-256, and declaration SHA-256 witho
 ```sh
 pnpm typecheck
 pnpm test
-pnpm build
-pnpm pack --dry-run
+pnpm check:dist
+pnpm check:exports
+npm pack --dry-run --ignore-scripts
 ```
+
+`dist` is committed so installs from GitHub source archives work without running package lifecycle scripts. After changing `src`, run `pnpm build` and commit the resulting `dist` changes; `pnpm check:dist` verifies that the committed JavaScript, declarations, and source maps are current.
 
 The default suite uses mocked HTTP and creates no billable infrastructure. Real-account acceptance testing should use a disposable Render workspace and is intentionally opt-in. Validate create/update/adopt/delete behavior and clean up through both Alchemy and the Render dashboard.
 

@@ -1,5 +1,5 @@
 node_modules/
-dist/
+# dist is intentionally tracked so GitHub source archives are installable.
 coverage/
 .env
 .env.*

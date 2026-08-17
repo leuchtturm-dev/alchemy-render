@@ -95,12 +95,9 @@
     "test:watch": "vitest",
     "generate:api": "node scripts/generate-api.mjs",
     "check:api": "node scripts/check-generated-api.mjs",
+    "check:dist": "node scripts/check-dist.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
     "prepack": "pnpm run clean && tsc -p tsconfig.build.json"
-  },
-  "peerDependencies": {
-    "alchemy": ">=2.0.0-beta.62 <2.1",
-    "effect": ">=4.0.0-beta.97 <4.1"
   },
   "devDependencies": {
     "@effect/vitest": "^4.0.0-beta.97",
@@ -119,6 +116,8 @@
     "access": "public"
   },
   "dependencies": {
+    "alchemy": ">=2.0.0-beta.62 <2.1",
+    "effect": ">=4.0.0-beta.97 <4.1",
     "openapi-fetch": "^0.15.0"
   }
 }

@@ -8,6 +8,12 @@ importers:
 
   .:
     dependencies:
+      alchemy:
+        specifier: '>=2.0.0-beta.62 <2.1'
+        version: 2.0.0-beta.62(@types/node@24.13.3)(effect@4.0.0-beta.97)(vite@8.2.0(@types/node@24.13.3)(yaml@2.9.0))(vitest@4.1.10(@types/node@24.13.3)(vite@8.2.0(@types/node@24.13.3)(yaml@2.9.0)))(workerd@1.20260704.1)(ws@8.21.2)
+      effect:
+        specifier: '>=4.0.0-beta.97 <4.1'
+        version: 4.0.0-beta.97
       openapi-fetch:
         specifier: ^0.15.0
         version: 0.15.2
@@ -18,12 +24,6 @@ importers:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
-      alchemy:
-        specifier: 2.0.0-beta.62
-        version: 2.0.0-beta.62(@types/node@24.13.3)(effect@4.0.0-beta.97)(vite@8.2.0(@types/node@24.13.3)(yaml@2.9.0))(vitest@4.1.10(@types/node@24.13.3)(vite@8.2.0(@types/node@24.13.3)(yaml@2.9.0)))(workerd@1.20260704.1)(ws@8.21.2)
-      effect:
-        specifier: 4.0.0-beta.97
-        version: 4.0.0-beta.97
       openapi-typescript:
         specifier: 7.13.0
         version: 7.13.0(typescript@6.0.3)
