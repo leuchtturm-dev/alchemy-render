@@ -95,6 +95,7 @@
     "test:watch": "vitest",
     "generate:api": "node scripts/generate-api.mjs",
     "check:api": "node scripts/check-generated-api.mjs",
+    "check:dist": "node scripts/check-dist.mjs",
     "check:exports": "node scripts/check-package-exports.mjs",
     "prepack": "pnpm run clean && tsc -p tsconfig.build.json"
   },
